@@ -1,5 +1,4 @@
 import { describe, it, expect } from 'vitest';
-import { sql as dsql } from 'drizzle-orm';
 import { getDb } from '../src/db/client.js';
 import { loadConfig } from '../src/config.js';
 import { appendAudit } from '../src/audit/writer.js';
@@ -27,14 +26,14 @@ describe('verifyChain', () => {
 
   it('detects a tampered row', async () => {
     const { db, sql } = getDb(cfg);
-    await appendAudit(db, cfg, mk());
+    const { seq } = await appendAudit(db, cfg, mk());
     // Simulate raw tamper (disable trigger, edit, re-enable) — an attacker with owner DB creds.
-    // Wrapped in one transaction: ALTER TABLE ... TRIGGER takes an ACCESS EXCLUSIVE lock,
-    // so concurrent test files (vitest runs files in parallel) block on this table rather
-    // than observing a window where the trigger is disabled.
+    // Wrapped in one transaction: DDL is transactional, so the disabled-trigger state is
+    // never committed/visible to other sessions until this transaction re-enables the
+    // trigger and commits — not lock-based reader blocking.
     await sql.begin(async (tx) => {
       await tx`alter table audit_records disable trigger trg_audit_no_mutate`;
-      await tx`update audit_records set verdict='deny' where seq=(select max(seq) from audit_records)`;
+      await tx`update audit_records set verdict='deny' where seq=${seq}`;
       await tx`alter table audit_records enable trigger trg_audit_no_mutate`;
     });
     const res = await verifyChain(db);
