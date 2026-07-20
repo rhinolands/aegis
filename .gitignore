@@ -4,3 +4,4 @@ dist
 *.wasm
 policy.wasm
 coverage
+.superpowers/
