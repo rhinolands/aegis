@@ -63,4 +63,93 @@ describe('canonical', () => {
     expect(d1).toBe(d2);
     expect(d1).toMatch(/^[0-9a-f]{64}$/);
   });
+
+  // Fix round 3: intrinsic totality hazards — throwing accessors, hostile proxies,
+  // and unbounded depth. Each of these must not throw, and must be deterministic
+  // across two independent calls (not merely "didn't throw once").
+
+  it('does not throw on an object with a throwing getter, and is deterministic', () => {
+    const obj = {
+      a: 1,
+      get boom(): number {
+        throw new Error('getter blew up');
+      },
+    };
+    let out1 = '';
+    let out2 = '';
+    let d1 = '';
+    let d2 = '';
+    expect(() => { out1 = canonical(obj); }).not.toThrow();
+    expect(() => { out2 = canonical(obj); }).not.toThrow();
+    expect(() => { d1 = argsDigest(obj); }).not.toThrow();
+    expect(() => { d2 = argsDigest(obj); }).not.toThrow();
+    expect(out1).toBe(out2);
+    expect(d1).toBe(d2);
+    expect(out1).toBe('{"a":1,"boom":{"$type":"unserializable"}}');
+  });
+
+  it('does not throw on a Proxy with a throwing get trap, and is deterministic', () => {
+    const proxy = new Proxy(
+      { a: 1, b: 2 },
+      {
+        get(): never {
+          throw new Error('get trap blew up');
+        },
+      },
+    );
+    let out1 = '';
+    let out2 = '';
+    let d1 = '';
+    let d2 = '';
+    expect(() => { out1 = canonical(proxy); }).not.toThrow();
+    expect(() => { out2 = canonical(proxy); }).not.toThrow();
+    expect(() => { d1 = argsDigest(proxy); }).not.toThrow();
+    expect(() => { d2 = argsDigest(proxy); }).not.toThrow();
+    expect(out1).toBe(out2);
+    expect(d1).toBe(d2);
+    // ownKeys is untrapped here so keys enumerate fine; every value read throws,
+    // so each key gets its own unserializable marker.
+    expect(out1).toBe('{"a":{"$type":"unserializable"},"b":{"$type":"unserializable"}}');
+  });
+
+  it('does not throw on a Proxy with a throwing ownKeys trap, and is deterministic', () => {
+    const proxy = new Proxy(
+      { a: 1, b: 2 },
+      {
+        ownKeys(): never {
+          throw new Error('ownKeys trap blew up');
+        },
+      },
+    );
+    let out1 = '';
+    let out2 = '';
+    let d1 = '';
+    let d2 = '';
+    expect(() => { out1 = canonical(proxy); }).not.toThrow();
+    expect(() => { out2 = canonical(proxy); }).not.toThrow();
+    expect(() => { d1 = argsDigest(proxy); }).not.toThrow();
+    expect(() => { d2 = argsDigest(proxy); }).not.toThrow();
+    expect(out1).toBe(out2);
+    expect(d1).toBe(d2);
+    expect(out1).toBe('{"$type":"unserializable"}');
+  });
+
+  it('does not throw (no RangeError) on a ~200k-deep nested object, and is deterministic', () => {
+    const DEPTH = 200_000;
+    let deep: Record<string, unknown> = { leaf: true };
+    for (let i = 0; i < DEPTH; i++) {
+      deep = { next: deep };
+    }
+    let out1 = '';
+    let out2 = '';
+    let d1 = '';
+    let d2 = '';
+    expect(() => { out1 = canonical(deep); }).not.toThrow();
+    expect(() => { out2 = canonical(deep); }).not.toThrow();
+    expect(() => { d1 = argsDigest(deep); }).not.toThrow();
+    expect(() => { d2 = argsDigest(deep); }).not.toThrow();
+    expect(out1).toBe(out2);
+    expect(d1).toBe(d2);
+    expect(d1).toMatch(/^[0-9a-f]{64}$/);
+  });
 });
