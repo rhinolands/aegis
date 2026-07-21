@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeAll } from 'vitest';
+import { describe, it, expect, beforeAll, afterEach, vi } from 'vitest';
 import { getDb } from '../src/db/client.js';
 import { loadConfig } from '../src/config.js';
 import { registerAgent } from '../src/identity/registry.js';
@@ -6,6 +6,7 @@ import { loadPolicy, type PolicyEngine } from '../src/policy/opa.js';
 import { seedBudget } from '../src/guard/budget.js';
 import { govern } from '../src/pipeline/govern.js';
 import { verifyChain } from '../src/audit/verify.js';
+import * as auditWriter from '../src/audit/writer.js';
 
 const cfg = loadConfig(process.env);
 let engine: PolicyEngine;
@@ -115,6 +116,86 @@ describe('govern pipeline', () => {
 
     expect([r1.status, r2.status, r3.status, r4.status]).toEqual([200, 403, 200, 403]);
     expect((await verifyChain(db)).ok).toBe(true);
+    await sql.end();
+  });
+});
+
+describe('govern pipeline — fail-closed hardening (failure injection)', () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it('deny path: audit write failure still resolves 403, never rejects', async () => {
+    const { db, sql } = getDb(cfg);
+    const { agent } = await registerAgent(db, { name: `gov-fc-deny-${Date.now()}`, tenant: 'test', allowedTools: ['fs.read'] });
+    await seedBudget(db, agent.id, 1_000_000, 1_000_000);
+
+    vi.spyOn(auditWriter, 'appendAudit').mockRejectedValue(new Error('audit db unreachable'));
+
+    // fs.write is not in allowedTools -> policy denies -> deny() path runs -> appendAudit throws (spied)
+    await expect(
+      govern(
+        { db, cfg, engine },
+        {
+          principal: { agentId: agent.id, name: agent.name, tenant: agent.tenant, onBehalfOf: [] },
+          agent, plane: 'mcp', request: { tool: 'fs.write', operation: 'call' },
+          target: 'mcp:filesystem', correlationId: crypto.randomUUID(), origin: 'test',
+        },
+        async () => ({ tokens: 0, costMicros: 0, body: {} }),
+      ),
+    ).resolves.toEqual({ status: 403, body: { error: expect.any(String) } });
+
+    await sql.end();
+  });
+
+  it('allow path: audit write failure AFTER a successful execute resolves 500 (not 200), never rejects', async () => {
+    const { db, sql } = getDb(cfg);
+    const { agent } = await registerAgent(db, { name: `gov-fc-allow-${Date.now()}`, tenant: 'test', allowedTools: ['fs.read'] });
+    await seedBudget(db, agent.id, 1_000_000, 1_000_000);
+
+    vi.spyOn(auditWriter, 'appendAudit').mockRejectedValue(new Error('audit db unreachable'));
+
+    let executed = false;
+    const res = await govern(
+      { db, cfg, engine },
+      {
+        principal: { agentId: agent.id, name: agent.name, tenant: agent.tenant, onBehalfOf: [] },
+        agent, plane: 'mcp', request: { tool: 'fs.read', operation: 'call' },
+        target: 'mcp:filesystem', correlationId: crypto.randomUUID(), origin: 'test',
+      },
+      async () => { executed = true; return { tokens: 1, costMicros: 1, body: { ok: true } }; },
+    );
+
+    expect(executed).toBe(true); // the upstream side effect DID happen
+    expect(res.status).toBe(500);
+    expect(res.status).not.toBe(200);
+
+    await sql.end();
+  });
+
+  it('a throw from the policy stage resolves 403, never rejects, and execute never runs', async () => {
+    const { db, sql } = getDb(cfg);
+    const { agent } = await registerAgent(db, { name: `gov-fc-policy-${Date.now()}`, tenant: 'test', allowedTools: ['fs.read'] });
+    await seedBudget(db, agent.id, 1_000_000, 1_000_000);
+
+    const throwingEngine: PolicyEngine = {
+      evaluate: () => { throw new Error('opa wasm trap'); },
+    };
+
+    let executed = false;
+    await expect(
+      govern(
+        { db, cfg, engine: throwingEngine },
+        {
+          principal: { agentId: agent.id, name: agent.name, tenant: agent.tenant, onBehalfOf: [] },
+          agent, plane: 'mcp', request: { tool: 'fs.read', operation: 'call' },
+          target: 'mcp:filesystem', correlationId: crypto.randomUUID(), origin: 'test',
+        },
+        async () => { executed = true; return { tokens: 0, costMicros: 0, body: {} }; },
+      ),
+    ).resolves.toMatchObject({ status: 403 });
+    expect(executed).toBe(false);
+
     await sql.end();
   });
 });
