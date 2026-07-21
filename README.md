@@ -103,7 +103,7 @@ npm test                    # 24 tests
 opa test policy/bundle -v   # 9 policy tests
 ```
 
-On a fresh database, `drizzle-kit migrate` prints a Postgres notice ending in `does_not_exist_skipping` before reporting success. That is expected and harmless: the append-only migration issues `DROP TRIGGER IF EXISTS` before creating the trigger, so the first run has nothing to drop. The migration is left as-is rather than edited, because it has already been applied — migrations here are append-only.
+Migrations run with `client_min_messages=warning` (set on the connection in `drizzle.config.ts`), so the benign `does not exist, skipping` notice from the append-only migration's `DROP TRIGGER IF EXISTS` doesn't read like a failure on a fresh database. Warnings and errors still surface. It is set on the connection rather than in the migration because migrations here are append-only and are never edited once applied.
 
 The integration tests run against a real Postgres — no mocked database. They run serially by design: the hash chain is global singleton state, so parallel test files would interleave chain writes.
 
