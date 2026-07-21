@@ -1,40 +1,130 @@
-# Aegis Agent Gateway
+# Aegis — Agent Governance Gateway
 
-Aegis is an agent governance gateway: a policy-enforcing proxy that sits in front of
-AI agent tool calls, evaluates them against OPA/Rego policy, and produces a tamper-evident
-audit trail.
+**One enforcement point for agent ingress, agent-to-agent (A2A) delegation, MCP tool egress, and LLM upstream calls.** AuthN at the edge, OPA policy authorization (deny-by-default), least-privilege per-agent identity, fail-closed everywhere, and a tamper-evident audit spine that answers *who / what / when / where / why / verdict* for every decision — allows **and** denies.
 
-## Status
+Apache-2.0. Self-hostable: one TypeScript service + Postgres.
 
-v0.1 foundation — under active development. Not yet production-ready.
+> **Status: v0.1 in progress — 9 of 20 planned tasks complete.** The foundation, the audit spine, and the policy engine are built and tested. The four mediation planes are not yet wired. See [What's actually built](#whats-actually-built) — that section is deliberately precise, because a governance tool that overstates its own guarantees is worse than none.
 
-## Requirements
+---
 
-- Node.js `>=22.0.0`
-- npm `>=10.0.0`
+## Why this exists
 
-## Getting started
+The LLM-proxy problem is solved. Routing, key vaulting, budgets, retries — LiteLLM, Portkey, Kong, and Cloudflare all do it well, and Aegis does **not** try to compete there. LiteLLM composes perfectly well *behind* this gateway.
+
+What remains underserved is **governance of what agents actually do**: which tools an agent may invoke, which peers it may delegate to, what credential is injected on its behalf, and whether any of it can be proven after the fact to an auditor. That is the problem Aegis addresses.
+
+The design premise: an agent should never hold a broad credential, never call a peer directly, and never take an action that isn't independently reconstructable from an append-only log.
+
+## Design principles
+
+| Principle | How it's enforced |
+|---|---|
+| **Deny-by-default** | OPA/Rego policy compiled to WASM, evaluated in-process. The `default decision` is `allow: false`. An unknown plane, tool, peer, or model is denied without a rule needing to exist. |
+| **Fail-closed** | Unknown caller, invalid credential, OPA error, missing budget, upstream failure → 403 **plus an audit record**. Every path through the policy evaluator returns a `Decision`; none can throw past the wrapper or coerce a non-boolean into an allow. |
+| **Identity is injected, never asserted** | The gateway derives identity from the presented credential and the database — never from the request body. Each agent has its own app-only identity. No user impersonation, ever; user actions carry user identity, agent actions carry agent identity plus an on-behalf-of chain. |
+| **Least-privilege credentials** | The agent authenticates with its own key. The gateway holds the scoped backend credential and injects it only after policy allows. A compromised agent key cannot exfiltrate the backend token. |
+| **Denies are logged like allows** | The deny log is the point. A governance system that only records successes cannot answer the question an auditor actually asks. |
+| **Tamper-evident, not just append-only** | Two database layers (privilege + trigger) stop mutation; a hash chain proves it. |
+
+## Architecture
+
+Every governed request flows through **one** pipeline — the planes differ only in how they build the policy input and how they execute upstream:
+
+```
+ caller ──JWT / API key──▶  1. AuthN at edge
+                            2. Identity injection (+ on-behalf-of chain)
+                            3. OPA eval  (WASM, in-process, deny-by-default)
+                            4. Guard     (rate / quota / budget)
+                            5. Execute   (proxy w/ scoped credential injection)
+                            6. Audit append  (allow AND deny)
+                                     │
+                        Postgres (identities, audit chain)
+                                     │ daily batch
+                        Object storage (JSONL + sha256 manifest, WORM-optional)
+```
+
+Four governed planes, one pipeline: **ingress**, **A2A** (peer allowlist — A may invoke B.op; agents never call each other directly), **MCP egress** (per-agent tool allowlist, gateway injects the scoped credential), **LLM upstream** (model allowlist, token/cost metering).
+
+## The audit spine
+
+This is the part worth reading the code for.
+
+**Hash chain.** `hash_n = sha256(hash_{n-1} ‖ canonical(record_n))`, where `canonical` is deterministic JSON with recursively sorted keys. `verifyChain()` replays the log in sequence order and recomputes every hash, detecting two distinct failure modes: a **hash mismatch** (a row was edited) and a **prevHash break** (a row was deleted or reordered).
+
+**Two layers of immutability.** The service role is granted `INSERT` + `SELECT` only on the audit table (a load-bearing GRANT), *and* a `BEFORE UPDATE OR DELETE` trigger raises on any mutation attempt. Both are exercised by tests.
+
+**Proven, not asserted.** The tamper test doesn't politely try an `UPDATE` and check for an error. It simulates an attacker who already holds owner-level database credentials: it **disables the trigger**, edits a record, re-enables it — and then shows `verifyChain()` still catches the edit. Defence-in-depth means the cryptographic layer has to hold when the database layer is bypassed.
+
+**Crypto-shredding.** GDPR erasure versus immutability is a real conflict. Payloads are encrypted (AES-256-GCM) under a per-subject data key wrapped by a master key; erasure destroys the key row, rendering the payload unrecoverable while the chain skeleton — and therefore the integrity proof — stays intact.
+
+**Boring export format, on purpose.** Daily JSONL segments plus a sha256 manifest and chain head. Auditors have `grep`; they should not need a bespoke reader.
+
+## What's actually built
+
+Verified by `npm test` (24 passing) and `opa test policy/bundle` (9 passing).
+
+**Complete and tested**
+- Config loading with fail-fast validation; Fastify server; health endpoint
+- Postgres schema + append-only migrations (drizzle)
+- Agent identity registry — bcrypt-hashed API keys, raw key returned exactly once, never persisted
+- Edge AuthN — API key + JWT/JWKS, resolving an injected `Principal`; fail-closed on every path
+- Audit record schema, deterministic canonicalization, args digesting (raw arguments are never stored)
+- AES-256-GCM crypto-shred with per-subject wrapped keys
+- Hash chain + transactional append-only writer (chain head advanced under `SELECT … FOR UPDATE`)
+- Append-only enforcement: GRANT-level privileges **and** a mutation-blocking trigger
+- `verifyChain()` full-chain verification, with tamper detection proven against a trigger bypass
+- OPA/Rego policy bundle — deny-by-default, tool/peer/model allowlists, compiled to WASM (`opa build -t wasm`)
+- In-process OPA evaluation with a fail-closed wrapper
+
+**Not yet built** (planned, tasks 10–20)
+- MCP, A2A, and LLM mediation planes, and the assembled govern pipeline
+- Scoped credential store wiring; rate/quota and budget guards
+- Daily object-storage export; Helm chart; end-to-end demo script; CI
+
+## Quickstart
+
+Requires Node ≥ 22, Docker, and the [`opa`](https://www.openpolicyagent.org/docs/latest/#running-opa) binary.
 
 ```bash
 npm install
-cp .env.example .env   # then fill in real values — never commit .env
-npm run dev
+
+# Postgres
+docker run -d --name aegis-pg \
+  -e POSTGRES_USER=aegis -e POSTGRES_PASSWORD=dev -e POSTGRES_DB=aegis \
+  -p 5432:5432 postgres:16
+
+export DATABASE_URL=postgres://aegis:dev@localhost:5432/aegis
+export AUDIT_MASTER_KEY=$(head -c32 /dev/zero | base64)   # dev only
+
+npx drizzle-kit migrate     # includes the append-only grants + trigger
+npm run build               # compiles the Rego policy to WASM, then TypeScript
+npm test                    # 24 tests
+opa test policy/bundle -v   # 9 policy tests
 ```
 
-## Scripts
+The integration tests run against a real Postgres — no mocked database. They run serially by design: the hash chain is global singleton state, so parallel test files would interleave chain writes.
 
-| Script | Purpose |
-| --- | --- |
-| `npm run dev` | Run the server locally with hot reload |
-| `npm run build` | Type-check and compile to `dist/` |
-| `npm run typecheck` | Type-check without emitting |
-| `npm test` | Run the unit test suite (vitest) |
+Because the tamper test deliberately breaks the chain, a *second* consecutive local run needs a reset:
+
+```bash
+docker exec aegis-pg psql -U aegis -d aegis -c "TRUNCATE audit_records, chain_head;"
+```
+
+## Notes on engineering approach
+
+Built test-first, one reviewed commit per task. A few things the process surfaced that are worth stating plainly:
+
+- The policy's `default` rule cannot reference the `policy_version` constant — OPA rejects variables in default rule values. The literal has to be duplicated, which creates a silent drift risk: a version bump would make *denied* requests misreport the policy version in the audit trail. There is now a regression test comparing the emitted version against the constant on both allow and deny paths, validated by injecting the drift and confirming the test fails.
+- `registerAgent` currently performs two non-transactional inserts. Known gap, tracked for the key-rotation work.
+- `TRUNCATE` is not caught by a row-level trigger. The append-only guarantee against truncation rests on the GRANT layer alone, which requires the least-privilege service role to actually exist — mandatory before any production deployment.
+
+## Roadmap
+
+v0.1 completes the four planes, guards, object-storage export, a k3s-first Helm chart, and a five-minute demo: register an agent → allowed tool call → unauthorized tool call returns 403 with a deny record → chain verification passes → tamper → chain verification fails.
+
+Deliberately out of scope for v0.1: admin console, SSO/OIDC admin plane, content-safety guard models, policy-bundle signing, Envoy integration.
 
 ## License
 
-Apache License 2.0 — see [LICENSE](LICENSE) and [NOTICE](NOTICE).
-
-## Contributing
-
-See [CONTRIBUTING.md](CONTRIBUTING.md). All contributions require signing the
-Contributor License Agreement (CLA), enforced automatically on pull requests.
+Apache-2.0 — see [LICENSE](LICENSE) and [NOTICE](NOTICE). Contributions require signing the CLA; see [CONTRIBUTING.md](CONTRIBUTING.md).
