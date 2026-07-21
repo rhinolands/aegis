@@ -173,6 +173,59 @@ describe('govern pipeline — fail-closed hardening (failure injection)', () => 
     await sql.end();
   });
 
+  it('allow path: ctx.args containing a BigInt resolves 200 (not a rejection), audit record written', async () => {
+    const { db, sql } = getDb(cfg);
+    const { agent } = await registerAgent(db, { name: `gov-fc-bigint-${Date.now()}`, tenant: 'test', allowedTools: ['fs.read'] });
+    await seedBudget(db, agent.id, 1_000_000, 1_000_000);
+    const before = await verifyChain(db);
+
+    await expect(
+      govern(
+        { db, cfg, engine },
+        {
+          principal: { agentId: agent.id, name: agent.name, tenant: agent.tenant, onBehalfOf: [] },
+          agent, plane: 'mcp', request: { tool: 'fs.read', operation: 'call' },
+          target: 'mcp:filesystem', correlationId: crypto.randomUUID(), origin: 'test',
+          args: { amount: 10n },
+        },
+        async () => ({ tokens: 1, costMicros: 1, body: { ok: true } }),
+      ),
+    ).resolves.toEqual({ status: 200, body: { ok: true } });
+
+    const after = await verifyChain(db);
+    expect(after.ok).toBe(true);
+    expect(after.checked).toBe(before.checked + 1); // one new (allow) record written
+    await sql.end();
+  });
+
+  it('deny path: circular ctx.args resolves 403, not a rejection', async () => {
+    const { db, sql } = getDb(cfg);
+    const { agent } = await registerAgent(db, { name: `gov-fc-circular-${Date.now()}`, tenant: 'test', allowedTools: ['fs.read'] });
+    await seedBudget(db, agent.id, 1_000_000, 1_000_000);
+
+    const circularArgs: Record<string, unknown> = { path: '/etc/hosts' };
+    circularArgs.self = circularArgs;
+
+    let executed = false;
+    await expect(
+      govern(
+        { db, cfg, engine },
+        {
+          principal: { agentId: agent.id, name: agent.name, tenant: agent.tenant, onBehalfOf: [] },
+          // fs.write is not in allowedTools -> policy denies -> deny() path builds baseRecord()
+          // with the circular args below.
+          agent, plane: 'mcp', request: { tool: 'fs.write', operation: 'call' },
+          target: 'mcp:filesystem', correlationId: crypto.randomUUID(), origin: 'test',
+          args: circularArgs,
+        },
+        async () => { executed = true; return { tokens: 0, costMicros: 0, body: {} }; },
+      ),
+    ).resolves.toEqual({ status: 403, body: { error: expect.any(String) } });
+    expect(executed).toBe(false);
+
+    await sql.end();
+  });
+
   it('a throw from the policy stage resolves 403, never rejects, and execute never runs', async () => {
     const { db, sql } = getDb(cfg);
     const { agent } = await registerAgent(db, { name: `gov-fc-policy-${Date.now()}`, tenant: 'test', allowedTools: ['fs.read'] });

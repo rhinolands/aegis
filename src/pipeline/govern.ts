@@ -56,11 +56,20 @@ export async function govern(
   // audit DB, rather than letting the exception escape and turn a deny into an
   // unhandled rejection.
   const deny = async (reason: string, policyVersion = 'v1'): Promise<{ status: number; body: unknown }> => {
-    const record = baseRecord('deny', reason, policyVersion);
+    // baseRecord() itself is now INSIDE this guarded try. canonical() (used by
+    // argsDigest() inside baseRecord) is total as of this fix and should never throw,
+    // but this is defense in depth: even a future serializer regression degrades to a
+    // logged-only record and a safe 403, instead of turning a deny into an unhandled
+    // rejection.
+    let record: AuditRecord | undefined;
     try {
+      record = baseRecord('deny', reason, policyVersion);
       await appendAudit(db, cfg, record, ctx.args);
     } catch (err) {
-      log.error({ err, auditRecord: record }, 'govern: deny-path audit write failed; record only recoverable from this log line');
+      log.error(
+        { err, auditRecord: record },
+        'govern: deny-path record construction or audit write failed; record only recoverable from this log line',
+      );
     }
     return { status: 403, body: { error: reason } };
   };
@@ -81,7 +90,7 @@ export async function govern(
     // Any unexpected fault in rate/policy/budget checks (WASM trap, DB blip, etc.)
     // must degrade to a deterministic deny rather than reject govern()'s promise —
     // nothing upstream has executed yet, so fail-closed is safe and lossless.
-    return deny(`pre-execution error: ${(err as Error).message}`, decision?.policyVersion ?? 'v1');
+    return deny(`pre-execution error: ${err instanceof Error ? err.message : String(err)}`, decision?.policyVersion ?? 'v1');
   }
 
   // 4. execute upstream; any failure => deny + audit (fail-closed)
@@ -89,7 +98,7 @@ export async function govern(
   try {
     result = await execute();
   } catch (err) {
-    return deny(`upstream error: ${(err as Error).message}`, decision.policyVersion);
+    return deny(`upstream error: ${err instanceof Error ? err.message : String(err)}`, decision.policyVersion);
   }
 
   // 5. meter + allow audit. The side effect has ALREADY happened (execute() above
@@ -101,18 +110,26 @@ export async function govern(
   // complete intended audit record at error level (recoverable/replayable from
   // logs even though it never reached Postgres) and return 500 to make the
   // partial-failure state visible to the caller instead of pretending it's fine.
-  const allowRecord = baseRecord('allow', decision.reason, decision.policyVersion);
+  // baseRecord() construction now happens INSIDE this guarded try (previously it ran
+  // before the try, so a throw from argsDigest()/canonical() — e.g. a BigInt or
+  // circular value in ctx.args, both realistic caller-supplied tool arguments — would
+  // escape as an unhandled rejection after execute() had already succeeded: upstream
+  // action done and billed, govern() rejects, no audit record, no defined response.
+  // canonical() is now total (see audit/record.ts) so this should never throw in
+  // practice; this restructuring is defense in depth for a future regression.
+  let allowRecord: AuditRecord | undefined;
   try {
+    allowRecord = baseRecord('allow', decision.reason, decision.policyVersion);
     await meterUsage(db, ctx.principal.agentId, result.tokens, result.costMicros);
     await appendAudit(db, cfg, allowRecord, ctx.args);
   } catch (err) {
     log.error(
       { err, auditRecord: allowRecord },
-      'govern: allow-path upstream executed but metering/audit write failed; record only recoverable from this log line',
+      'govern: allow-path upstream executed but record construction, metering, or audit write failed; record only recoverable from this log line',
     );
     return {
       status: 500,
-      body: { error: 'upstream action executed but audit record could not be written', recordId: allowRecord.id },
+      body: { error: 'upstream action executed but audit record could not be written', recordId: allowRecord?.id },
     };
   }
   return { status: 200, body: result.body };

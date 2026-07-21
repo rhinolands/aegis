@@ -14,4 +14,53 @@ describe('canonical', () => {
     expect(d1).toMatch(/^[0-9a-f]{64}$/);
     expect(d1).not.toContain('/etc/hosts');
   });
+
+  // Regression pin: this exact string must never change for a plain, already-serializable
+  // input. The audit hash chain (audit/chain.ts) hashes canonical() output directly, so
+  // any future change to the serializer that alters this string invalidates every
+  // previously-written audit record's hash. If this test ever needs to change, that is a
+  // breaking change to the hash chain and must be treated as such, not a routine update.
+  it('canonical output for a plain object is pinned (hash-chain stability regression guard)', () => {
+    const out = canonical({ b: 2, a: 1, nested: { y: 1, x: 2 } });
+    expect(out).toBe('{"a":1,"b":2,"nested":{"x":2,"y":1}}');
+  });
+
+  it('does not throw on a BigInt value, and is deterministic', () => {
+    const out1 = canonical({ amount: 10n });
+    const out2 = canonical({ amount: 10n });
+    expect(() => canonical({ amount: 10n })).not.toThrow();
+    expect(out1).toBe(out2);
+    expect(out1).toBe('{"amount":{"$type":"bigint","value":"10"}}');
+  });
+
+  it('argsDigest with a BigInt value does not throw, is deterministic, and is a stable 64-hex digest', () => {
+    let d1 = '';
+    let d2 = '';
+    expect(() => { d1 = argsDigest({ amount: 10n }); }).not.toThrow();
+    expect(() => { d2 = argsDigest({ amount: 10n }); }).not.toThrow();
+    expect(d1).toBe(d2);
+    expect(d1).toMatch(/^[0-9a-f]{64}$/);
+  });
+
+  it('does not throw on a circular object, and is deterministic', () => {
+    const obj: Record<string, unknown> = { a: 1 };
+    obj.self = obj;
+    let out1 = '';
+    let out2 = '';
+    expect(() => { out1 = canonical(obj); }).not.toThrow();
+    expect(() => { out2 = canonical(obj); }).not.toThrow();
+    expect(out1).toBe(out2);
+    expect(out1).toBe('{"a":1,"self":"[Circular]"}');
+  });
+
+  it('argsDigest with a circular object does not throw and is deterministic', () => {
+    const obj: Record<string, unknown> = { a: 1 };
+    obj.self = obj;
+    let d1 = '';
+    let d2 = '';
+    expect(() => { d1 = argsDigest(obj); }).not.toThrow();
+    expect(() => { d2 = argsDigest(obj); }).not.toThrow();
+    expect(d1).toBe(d2);
+    expect(d1).toMatch(/^[0-9a-f]{64}$/);
+  });
 });
