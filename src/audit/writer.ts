@@ -2,7 +2,7 @@ import { eq } from 'drizzle-orm';
 import type { DrizzleDb } from '../db/client.js';
 import type { Config } from '../config.js';
 import { auditRecords, chainHead } from '../db/schema.js';
-import type { AuditRecord } from './record.js';
+import { canonical, type AuditRecord } from './record.js';
 import { computeHash, GENESIS_HASH } from './chain.js';
 import { getOrCreateSubjectKey, encryptPayload } from './crypto.js';
 
@@ -12,7 +12,12 @@ export async function appendAudit(
   let payloadCiphertext: string | null = null;
   if (payload !== undefined && rec.subjectKeyId) {
     const key = await getOrCreateSubjectKey(db, cfg, rec.subjectKeyId);
-    payloadCiphertext = encryptPayload(key, JSON.stringify(payload));
+    // Use canonical() (total serializer, see audit/record.ts), not a raw JSON.stringify:
+    // `payload` here is ctx.args, the same caller-supplied raw tool arguments that made
+    // argsDigest() unsafe before this fix round. A bare JSON.stringify(payload) has the
+    // identical BigInt/circular throw hazard, just one level deeper — inside the very
+    // appendAudit() call that govern.ts's allow/deny paths depend on never throwing.
+    payloadCiphertext = encryptPayload(key, canonical(payload));
   }
 
   return db.transaction(async (tx) => {

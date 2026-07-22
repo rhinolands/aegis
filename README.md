@@ -4,7 +4,7 @@
 
 Apache-2.0. Self-hostable: one TypeScript service + Postgres.
 
-> **Status: v0.1 in progress — 9 of 20 planned tasks complete.** The foundation, the audit spine, and the policy engine are built and tested. The four mediation planes are not yet wired. See [What's actually built](#whats-actually-built) — that section is deliberately precise, because a governance tool that overstates its own guarantees is worse than none.
+> **Status: v0.1 in progress — 12 of 20 planned tasks complete.** The foundation, the audit spine, the policy engine, the guards, and the single govern pipeline are built and tested. The three mediation planes that sit on top of the pipeline are not yet wired. See [What's actually built](#whats-actually-built) — that section is deliberately precise, because a governance tool that overstates its own guarantees is worse than none.
 
 ---
 
@@ -62,7 +62,7 @@ This is the part worth reading the code for.
 
 ## What's actually built
 
-Verified by `npm test` (24 passing) and `opa test policy/bundle` (9 passing).
+Verified by `npm test` (48 passing) and `opa test policy/bundle` (9 passing).
 
 **Complete and tested**
 - Config loading with fail-fast validation; Fastify server; health endpoint
@@ -77,10 +77,25 @@ Verified by `npm test` (24 passing) and `opa test policy/bundle` (9 passing).
 - OPA/Rego policy bundle — deny-by-default, tool/peer/model allowlists, compiled to WASM (`opa build -t wasm`)
 - In-process OPA evaluation with a fail-closed wrapper
 
-**Not yet built** (planned, tasks 10–20)
-- MCP, A2A, and LLM mediation planes, and the assembled govern pipeline
-- Scoped credential store wiring; rate/quota and budget guards
+- Scoped backend credential store — secrets encrypted at rest, scoped by `(agentId, target)`, with agent isolation explicitly tested
+- Per-agent rate limiting (in-process sliding window) and fail-closed budget metering — an agent with no configured budget is denied, not granted unlimited spend
+- **The govern pipeline** — the single ordered enforcement path (rate → policy → budget → execute → meter + audit) that all planes reuse. Denies short-circuit before any upstream call; allows and denies are both audited; `govern()` never throws, degrading to a deterministic status instead (see [fail-closed behaviour](#fail-closed-behaviour-of-the-pipeline))
+
+**Not yet built** (planned, tasks 13–20)
+- MCP, A2A, and LLM mediation planes (the pipeline they plug into is done)
 - Daily object-storage export; Helm chart; end-to-end demo script; CI
+
+## Fail-closed behaviour of the pipeline
+
+`govern()` always returns a status — it never rejects. The interesting case is an audit-write failure, because the audit record *is* the product:
+
+| Situation | Behaviour |
+|---|---|
+| Rate, policy, or budget check throws | audit attempt, then **403** — nothing has executed yet, so this is lossless |
+| Deny-path audit write fails | still **403**; the full intended record is logged at error level |
+| Allow-path audit write fails *after* the upstream call ran | **500**, not 200 — the side effect already happened and cannot be reported as clean success; the full record is logged so it is recoverable |
+
+Because an audit record must be constructible before it can be written, `canonical()` is intrinsically total: BigInt values, circular references, throwing getters, hostile `Proxy` traps, and unbounded nesting all serialize deterministically rather than throwing. Inputs that already serialized are byte-identical to before, pinned by a regression test — a change that would invalidate existing audit chains fails loudly.
 
 ## Quickstart
 
