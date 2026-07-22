@@ -4,10 +4,11 @@ import type { Config } from './config.js';
 import type { DrizzleDb } from './db/client.js';
 import type { PolicyEngine } from './policy/opa.js';
 import { registerMcpPlane } from './planes/mcp.js';
+import { registerA2aPlane } from './planes/a2a.js';
 
-// NOTE: the A2A and LLM planes are built in later tasks (their modules do not
-// exist yet). Only the MCP plane is registered here — do not import the
-// others until they land, or this module fails to resolve.
+// NOTE: the LLM plane is built in a later task (its module does not exist
+// yet). Only the MCP and A2A planes are registered here — do not import the
+// LLM plane until it lands, or this module fails to resolve.
 export interface ServerDeps { cfg: Config; db: DrizzleDb; engine: PolicyEngine }
 
 export function buildServer(deps: ServerDeps): FastifyInstance {
@@ -18,6 +19,7 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
   // /health stays dependency-free so it works before the DB/policy engine are reachable.
   app.get('/health', async () => ({ status: 'ok' }));
   registerMcpPlane(app, deps);
+  registerA2aPlane(app, deps);
   return app;
 }
 
