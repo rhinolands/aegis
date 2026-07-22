@@ -77,6 +77,12 @@ export function registerA2aPlane(app: FastifyInstance, deps: ServerDeps): void {
           // 403 — we must never fall back to any caller-supplied value.
           throw new Error('no registered upstream destination for this peer');
         }
+        // redirect: 'manual' + explicit 3xx rejection below: a mediated call
+        // must terminate at the operator-registered destination and must
+        // never be silently redirected elsewhere. Node 22's undici happens to
+        // strip Authorization on a cross-origin redirect, but that is runtime
+        // behaviour we do not control and must not rely on — this asserts the
+        // safety property in our own code instead.
         const upstream = await fetch(registered.upstreamUrl, {
           method: 'POST',
           headers: {
@@ -84,7 +90,11 @@ export function registerA2aPlane(app: FastifyInstance, deps: ServerDeps): void {
             'x-on-behalf-of': callerPrincipal.onBehalfOf.join('>'),
           },
           body: JSON.stringify({ operation, args }),
+          redirect: 'manual',
         });
+        if (upstream.status >= 300 && upstream.status < 400) {
+          throw new Error(`peer attempted redirect (${upstream.status})`);
+        }
         const body = await upstream.json().catch(() => ({}));
         if (!upstream.ok) throw new Error(`peer ${upstream.status}`);
         return { tokens: 0, costMicros: 0, body };

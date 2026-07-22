@@ -13,6 +13,16 @@ export async function putCredential(
   });
 }
 
+// Returns the secret ONLY — there is no destination attached to this result.
+// Do NOT use this to drive an outbound request's destination: it has no
+// upstream URL to leak, but a caller that pairs this secret with any
+// caller-influenced or otherwise-sourced URL recreates the exact
+// credential-exfiltration primitive this codebase has already had to fix
+// once (an agent redirecting its own scoped credential to a server it
+// controls). Any plane that mediates an outbound call carrying a credential
+// MUST use getCredentialTarget() instead, so the destination is always
+// resolved from the operator-registered scoped_credentials row rather than
+// from the caller.
 export async function getCredential(
   db: DrizzleDb, cfg: Config, agentId: string, target: string,
 ): Promise<string | null> {

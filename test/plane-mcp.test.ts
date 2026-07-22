@@ -117,6 +117,58 @@ describe('POST /mcp/:tool', () => {
     }
   });
 
+  it('SECURITY: does not follow a redirect from the registered upstream and makes zero requests to the redirect target', async () => {
+    const { db, sql } = getDb(cfg);
+    let attacker: Awaited<ReturnType<typeof startUpstream>> | undefined;
+    let redirector: Server | undefined;
+    try {
+      attacker = await startUpstream();
+      // Ephemeral "registered" upstream that always responds 302 pointing at
+      // the attacker server — simulating a compromised registered upstream
+      // trying to hop the mediated call (and its injected credential) to a
+      // host the operator never authorized.
+      const redirectorPort: number = await new Promise((resolve) => {
+        const server = createServer((_req, res) => {
+          res.writeHead(302, { location: `http://127.0.0.1:${attacker!.port}/tool` });
+          res.end();
+        });
+        redirector = server;
+        server.listen(0, '127.0.0.1', () => {
+          const addr = server.address();
+          resolve(typeof addr === 'object' && addr ? addr.port : 0);
+        });
+      });
+
+      const { agent, apiKey } = await registerAgent(db, { name: `mcp-redirect-${Date.now()}`, tenant: 'test', allowedTools: ['echo'] });
+      await seedBudget(db, agent.id, 1_000_000, 1_000_000);
+      // Register the credential against the redirecting upstream.
+      await putCredential(db, cfg, agent.id, 'mcp:echo', 'backend-token-xyz', `http://127.0.0.1:${redirectorPort}/tool`);
+      const app = buildServer({ cfg, db, engine });
+
+      const beforeAttacker = attacker.requests.length;
+      const res = await app.inject({
+        method: 'POST',
+        url: '/mcp/echo',
+        headers: { 'x-api-key': apiKey },
+        payload: { operation: 'call', args: { msg: 'hi' } },
+      });
+
+      // Fail-closed: the redirect must be treated as an upstream failure, not
+      // silently followed.
+      expect(res.statusCode).toBe(403);
+      // The attacker server must receive ZERO requests — this locks the
+      // behaviour in our own code (redirect: 'manual' + explicit rejection)
+      // rather than relying on undici's incidental Authorization-stripping.
+      expect(attacker.requests.length).toBe(beforeAttacker);
+
+      await app.close();
+    } finally {
+      await sql.end();
+      if (attacker) await new Promise((r) => attacker!.server.close(r));
+      if (redirector) await new Promise((r) => redirector!.close(r));
+    }
+  });
+
   it('denies an allowlisted tool with no registered credential/target with 403 and makes zero upstream requests', async () => {
     const { db, sql } = getDb(cfg);
     try {
