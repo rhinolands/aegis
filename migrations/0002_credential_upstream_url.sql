@@ -1,0 +1,1 @@
+ALTER TABLE "scoped_credentials" ADD COLUMN "upstream_url" text;

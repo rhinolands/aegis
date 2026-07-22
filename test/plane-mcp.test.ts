@@ -47,12 +47,14 @@ describe('POST /mcp/:tool', () => {
   beforeAll(async () => { upstream = await startUpstream(); });
   afterAll(async () => { await new Promise((r) => upstream.server.close(r)); });
 
-  it('allows a whitelisted tool, calls upstream, and injects the scoped credential the caller never held', async () => {
+  it('allows a whitelisted tool, calls the operator-registered upstream, and injects the scoped credential the caller never held', async () => {
     const { db, sql } = getDb(cfg);
     try {
       const { agent, apiKey } = await registerAgent(db, { name: `mcp-${Date.now()}`, tenant: 'test', allowedTools: ['echo'] });
       await seedBudget(db, agent.id, 1_000_000, 1_000_000);
-      await putCredential(db, cfg, agent.id, 'mcp:echo', 'backend-token-xyz');
+      // The upstream destination is registered by the operator alongside the
+      // credential — never supplied by the caller in the request body.
+      await putCredential(db, cfg, agent.id, 'mcp:echo', 'backend-token-xyz', `http://127.0.0.1:${upstream.port}/tool`);
       const app = buildServer({ cfg, db, engine });
 
       const before = upstream.requests.length;
@@ -60,7 +62,7 @@ describe('POST /mcp/:tool', () => {
         method: 'POST',
         url: '/mcp/echo',
         headers: { 'x-api-key': apiKey },
-        payload: { operation: 'call', args: { msg: 'hi' }, upstreamUrl: `http://127.0.0.1:${upstream.port}/tool` },
+        payload: { operation: 'call', args: { msg: 'hi' } },
       });
 
       expect(res.statusCode).toBe(200);
@@ -70,6 +72,69 @@ describe('POST /mcp/:tool', () => {
       // presented its own api key and never possessed this value.
       expect(received.headers['authorization']).toBe('Bearer backend-token-xyz');
       expect(received.body).toEqual({ operation: 'call', args: { msg: 'hi' } });
+
+      await app.close();
+    } finally {
+      await sql.end();
+    }
+  });
+
+  it('SECURITY: ignores a caller-supplied upstreamUrl and never contacts the attacker-controlled server', async () => {
+    const { db, sql } = getDb(cfg);
+    let attacker: Awaited<ReturnType<typeof startUpstream>> | undefined;
+    try {
+      attacker = await startUpstream();
+      const { agent, apiKey } = await registerAgent(db, { name: `mcp-exfil-${Date.now()}`, tenant: 'test', allowedTools: ['echo'] });
+      await seedBudget(db, agent.id, 1_000_000, 1_000_000);
+      // Register the credential against the LEGITIMATE upstream only.
+      await putCredential(db, cfg, agent.id, 'mcp:echo', 'backend-token-xyz', `http://127.0.0.1:${upstream.port}/tool`);
+      const app = buildServer({ cfg, db, engine });
+
+      const beforeLegit = upstream.requests.length;
+      const beforeAttacker = attacker.requests.length;
+      const res = await app.inject({
+        method: 'POST',
+        url: '/mcp/echo',
+        headers: { 'x-api-key': apiKey },
+        // Attacker-controlled agent still tries to redirect the credential.
+        payload: { operation: 'call', args: { msg: 'hi' }, upstreamUrl: `http://127.0.0.1:${attacker.port}/tool` },
+      });
+
+      expect(res.statusCode).toBe(200);
+      // The attacker server must receive ZERO requests — this is the whole
+      // point of resolving the destination server-side.
+      expect(attacker.requests.length).toBe(beforeAttacker);
+      // The legitimate, operator-registered upstream received exactly one
+      // request, with the scoped credential attached.
+      expect(upstream.requests.length).toBe(beforeLegit + 1);
+      const received = upstream.requests[upstream.requests.length - 1];
+      expect(received.headers['authorization']).toBe('Bearer backend-token-xyz');
+
+      await app.close();
+    } finally {
+      await sql.end();
+      if (attacker) await new Promise((r) => attacker!.server.close(r));
+    }
+  });
+
+  it('denies an allowlisted tool with no registered credential/target with 403 and makes zero upstream requests', async () => {
+    const { db, sql } = getDb(cfg);
+    try {
+      const { agent, apiKey } = await registerAgent(db, { name: `mcp-notarget-${Date.now()}`, tenant: 'test', allowedTools: ['echo'] });
+      await seedBudget(db, agent.id, 1_000_000, 1_000_000);
+      // No putCredential call at all — no registered target for mcp:echo.
+      const app = buildServer({ cfg, db, engine });
+
+      const before = upstream.requests.length;
+      const res = await app.inject({
+        method: 'POST',
+        url: '/mcp/echo',
+        headers: { 'x-api-key': apiKey },
+        payload: { operation: 'call', args: {} },
+      });
+
+      expect(res.statusCode).toBe(403);
+      expect(upstream.requests.length).toBe(before);
 
       await app.close();
     } finally {
@@ -89,7 +154,7 @@ describe('POST /mcp/:tool', () => {
         method: 'POST',
         url: '/mcp/danger',
         headers: { 'x-api-key': apiKey },
-        payload: { operation: 'call', args: {}, upstreamUrl: `http://127.0.0.1:${upstream.port}/tool` },
+        payload: { operation: 'call', args: {} },
       });
 
       expect(res.statusCode).toBe(403);
@@ -111,7 +176,7 @@ describe('POST /mcp/:tool', () => {
       const res = await app.inject({
         method: 'POST',
         url: '/mcp/echo',
-        payload: { operation: 'call', args: {}, upstreamUrl: `http://127.0.0.1:${upstream.port}/tool` },
+        payload: { operation: 'call', args: {} },
       });
       expect(res.statusCode).toBe(403);
       expect(upstream.requests.length).toBe(before);
