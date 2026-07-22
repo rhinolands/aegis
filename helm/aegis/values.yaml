@@ -1,0 +1,39 @@
+image:
+  repository: aegis
+  tag: dev
+  pullPolicy: IfNotPresent
+
+# v0.1 is single-replica BY DESIGN: the rate limiter (@fastify/rate-limit) is
+# in-process, not backed by a shared store (e.g. Redis). Scaling replicas
+# beyond 1 would silently multiply the effective rate limit per caller.
+# Revisit once the limiter is backed by shared state.
+replicaCount: 1
+
+service:
+  port: 8080
+
+config:
+  jwksUrls: ""   # comma-separated JWKS URLs the gateway trusts for caller JWTs (optional in v0.1)
+
+database:
+  url: ""        # postgres://... — set via --set or a sealed secret, never committed
+
+# Object-store target for audit export. Swap MinIO (k3s default) for S3, Azure
+# Blob (S3-compatible gateway), or GCS (S3 interoperability endpoint) purely by
+# changing endpoint/region + the access/secret keys below — no code change.
+objectStore:
+  endpoint: "http://minio:9000"
+  bucket: "aegis-audit"
+  region: "us-east-1"
+
+# Secrets: placeholders only. Real values are supplied at install time via
+# --set, --set-file, -f a local (gitignored) values override, or a sealed-secrets/
+# external-secrets pipeline. Nothing here is a usable credential.
+secrets:
+  auditMasterKey: ""   # base64, 32 bytes — required, decrypted/validated at app startup
+  s3AccessKey: ""
+  s3SecretKey: ""
+
+# Runs a pre-install/pre-upgrade Helm hook Job (drizzle-kit migrate) before the
+# Deployment rolls out. Disable if migrations are run out-of-band.
+migrateOnInstall: true

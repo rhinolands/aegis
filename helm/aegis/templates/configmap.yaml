@@ -1,0 +1,10 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ .Release.Name }}-config
+data:
+  PORT: {{ .Values.service.port | quote }}
+  JWT_JWKS_URLS: {{ .Values.config.jwksUrls | quote }}
+  EXPORT_S3_ENDPOINT: {{ .Values.objectStore.endpoint | quote }}
+  EXPORT_S3_BUCKET: {{ .Values.objectStore.bucket | quote }}
+  EXPORT_S3_REGION: {{ .Values.objectStore.region | quote }}
