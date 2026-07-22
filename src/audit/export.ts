@@ -12,6 +12,7 @@ import { auditRecords, chainHead } from '../db/schema.js';
 // they downloaded and compare to the recorded value.
 
 export function serializeSegment(rows: Array<Record<string, unknown>>): string {
+  if (rows.length === 0) return '';
   return rows.map((r) => JSON.stringify(r)).join('\n') + '\n';
 }
 
