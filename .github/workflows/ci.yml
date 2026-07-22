@@ -123,9 +123,15 @@ jobs:
     permissions:
       contents: write
       pull-requests: write
+    # The `secrets` context is NOT available in step-level `if:` expressions —
+    # using it there makes GitHub reject the whole workflow file before any job
+    # starts (that is what broke run 29935052845). It IS allowed in a job-level
+    # `env:`, so map it once here and gate the steps on the env value instead.
+    env:
+      HAS_CLA_PAT: ${{ secrets.PERSONAL_ACCESS_TOKEN != '' }}
     steps:
       - name: CLA Assistant
-        if: ${{ secrets.PERSONAL_ACCESS_TOKEN != '' }}
+        if: env.HAS_CLA_PAT == 'true'
         uses: contributor-assistant/github-action@v2.6.1
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -137,6 +143,6 @@ jobs:
           allowlist: dependabot[bot]
 
       - name: CLA setup pending
-        if: ${{ secrets.PERSONAL_ACCESS_TOKEN == '' }}
+        if: env.HAS_CLA_PAT != 'true'
         run: |
           echo "::notice::cla-assistant is not configured yet (no PERSONAL_ACCESS_TOKEN secret) — an owner must install the GitHub App and add the secret. This job is non-blocking until then."
