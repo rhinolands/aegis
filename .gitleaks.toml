@@ -1,0 +1,19 @@
+title = "aegis gitleaks"
+
+[extend]
+useDefault = true
+
+[allowlist]
+description = "example/placeholder values only — no real secrets"
+regexes = [
+  '''CHANGE_ME''',
+  '''REPLACE_WITH_BASE64_32_BYTES''',
+  # Throwaway all-zero base64 AUDIT_MASTER_KEY used only in CI/e2e workflows
+  # and the local demo — never a real key.
+  '''AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=''',
+]
+paths = [
+  '''\.env\.example$''',
+  '''\.github/workflows/ci\.yml$''',
+  '''\.forgejo/workflows/e2e\.yml$''',
+]

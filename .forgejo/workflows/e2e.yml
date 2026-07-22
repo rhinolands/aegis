@@ -1,0 +1,36 @@
+name: e2e
+on:
+  workflow_dispatch:
+
+jobs:
+  e2e:
+    runs-on: ct102
+    steps:
+      - uses: actions/checkout@v4
+
+      - run: npm ci
+
+      - name: start postgres
+        run: |
+          docker rm -f aegis-e2e-pg >/dev/null 2>&1 || true
+          docker run -d --name aegis-e2e-pg \
+            -e POSTGRES_USER=aegis -e POSTGRES_PASSWORD=dev -e POSTGRES_DB=aegis \
+            -p 5432:5432 postgres:16
+          for i in $(seq 1 30); do
+            docker exec aegis-e2e-pg pg_isready -U aegis && break
+            sleep 2
+          done
+
+      - name: build + migrate + demo
+        env:
+          DATABASE_URL: postgres://aegis:dev@localhost:5432/aegis
+          # Throwaway all-zero base64 key for this dispatch-only e2e run —
+          # NOT a real secret. Real keys never appear in workflow files.
+          AUDIT_MASTER_KEY: AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=
+        run: |
+          npm run build
+          npx drizzle-kit migrate
+          bash scripts/demo.sh
+
+      - if: always()
+        run: docker rm -f aegis-e2e-pg || true

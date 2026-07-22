@@ -1,0 +1,101 @@
+name: ci
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  build-test:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: aegis
+          POSTGRES_PASSWORD: dev
+          POSTGRES_DB: aegis
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U aegis"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+      minio:
+        image: bitnami/minio:latest
+        env:
+          MINIO_ROOT_USER: aegis
+          MINIO_ROOT_PASSWORD: aegis12345
+          MINIO_DEFAULT_BUCKETS: aegis-audit
+        ports: ["9000:9000"]
+        options: >-
+          --health-cmd "curl -f http://localhost:9000/minio/health/live || exit 1"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      DATABASE_URL: postgres://aegis:dev@localhost:5432/aegis
+      # Throwaway all-zero base64 key for CI only — NOT a real secret. Real
+      # keys come from GitHub Actions secrets / sealed secrets in deploys.
+      AUDIT_MASTER_KEY: AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=
+      # RUN_S3_INTEGRATION=1 makes the MinIO export test a hard gate: if
+      # MinIO is unreachable when this is set, the test FAILS rather than
+      # silently skipping (see test/audit-export.test.ts).
+      RUN_S3_INTEGRATION: "1"
+      EXPORT_S3_ENDPOINT: http://localhost:9000
+      EXPORT_S3_BUCKET: aegis-audit
+      EXPORT_S3_ACCESS_KEY: aegis
+      EXPORT_S3_SECRET_KEY: aegis12345
+      EXPORT_S3_REGION: us-east-1
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: install opa
+        run: |
+          curl -L -o /usr/local/bin/opa https://openpolicyagent.org/downloads/latest/opa_linux_amd64_static
+          sudo chmod +x /usr/local/bin/opa
+          opa version
+
+      - run: npm ci
+
+      - name: build (policy WASM + tsc)
+        run: npm run build
+
+      - run: npm run typecheck
+
+      - name: opa test (policy/bundle)
+        run: opa test policy/bundle -v
+
+      - name: migrate
+        run: npx drizzle-kit migrate
+
+      - name: test (vitest, serial — shared Postgres + hash chain)
+        run: npm test
+
+  gitleaks:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  cla:
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request'
+    steps:
+      - name: CLA Assistant
+        uses: contributor-assistant/github-action@v2.6.1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          path-to-signatures: "signatures/cla.json"
+          path-to-document: "https://github.com/rhinolands/aegis/blob/main/CLA.md"
+          branch: main
+          allowlist: dependabot[bot]
