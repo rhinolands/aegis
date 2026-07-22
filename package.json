@@ -10,6 +10,7 @@
     "build": "npm run build:policy && tsc -p tsconfig.json",
     "build:policy": "bash scripts/build-policy.sh",
     "start": "node dist/index.js",
+    "register": "tsx scripts/register.ts",
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
     "test:opa": "opa test policy/bundle -v",
