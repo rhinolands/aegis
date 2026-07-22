@@ -41,11 +41,20 @@ const COST_MICROS_PER_1K: Record<string, number> = {
   'claude-opus-4-8': 15000,
 };
 
+// Coerce every usage field through Number(...) || 0 before arithmetic. An
+// upstream is untrusted input: if it returns a field as a string (e.g.
+// usage.input_tokens: "40"), naive `+` does string concatenation instead of
+// addition ("40" + 60 === "4060"), silently inflating the metered token
+// count (and therefore costMicros) by orders of magnitude. Number(x) || 0
+// also turns NaN/undefined/null/non-numeric strings into 0 rather than
+// propagating garbage into the meter.
 function extractTokens(style: 'anthropic' | 'openai', body: unknown): number {
-  const u = (body as { usage?: Record<string, number> } | null | undefined)?.usage;
+  const u = (body as { usage?: Record<string, unknown> } | null | undefined)?.usage;
   if (!u) return 0;
-  if (style === 'anthropic') return (u.input_tokens ?? 0) + (u.output_tokens ?? 0);
-  return u.total_tokens ?? (u.prompt_tokens ?? 0) + (u.completion_tokens ?? 0);
+  const n = (v: unknown): number => Number(v) || 0;
+  if (style === 'anthropic') return n(u.input_tokens) + n(u.output_tokens);
+  if (u.total_tokens != null) return n(u.total_tokens);
+  return n(u.prompt_tokens) + n(u.completion_tokens);
 }
 
 export function registerLlmPlane(app: FastifyInstance, deps: ServerDeps): void {
@@ -113,10 +122,21 @@ export function registerLlmPlane(app: FastifyInstance, deps: ServerDeps): void {
         // strip auth headers on a cross-origin redirect, but that is runtime
         // behaviour we do not control and must not rely on — this asserts the
         // safety property in our own code instead.
+        // Trusted, policy-gated values (`model`, `operation`) are spread LAST,
+        // after `...payload`, so they always win over any caller-supplied key
+        // of the same name. `payload` is fully caller-controlled
+        // (z.record(z.string(), z.unknown()), no key restriction) — if it
+        // were spread last, a caller could send payload.model to silently
+        // execute against a different model than the one OPA just checked
+        // (input.request.model), corrupting cost accounting (costMicros is
+        // computed from the gated `model` below) and falsifying the audit
+        // record (`what.target` names the model that was actually gated, not
+        // whatever ran upstream). Do NOT "tidy" this back to
+        // `{ model, operation, ...payload }` — that reintroduces the bypass.
         const upstream = await fetch(registered.upstreamUrl, {
           method: 'POST',
           headers,
-          body: JSON.stringify({ model, operation, ...payload }),
+          body: JSON.stringify({ ...payload, model, operation }),
           redirect: 'manual',
         });
         if (upstream.status >= 300 && upstream.status < 400) {
