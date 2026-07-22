@@ -4,11 +4,11 @@ Thank you for your interest in contributing to Aegis.
 
 ## Contributor License Agreement (CLA)
 
-All contributions require signing the Contributor License Agreement (CLA) before a
-pull request can be merged. This is enforced automatically by the `cla-assistant` bot,
-which will comment on your pull request with a link to sign if you haven't already.
-Signing is a one-time action per contributor (or per organization, for corporate
-contributions).
+All contributions require signing the [Contributor License Agreement](CLA.md) (CLA)
+before a pull request can be merged. This is enforced automatically by the
+`cla-assistant` bot, which will comment on your pull request with a link to sign
+if you haven't already. Signing is a one-time action per contributor (or per
+organization, for corporate contributions).
 
 Pull requests that have not signed the CLA will be blocked from merging until the
 CLA check passes.

@@ -1,0 +1,148 @@
+name: ci
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  build-test:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: aegis
+          POSTGRES_PASSWORD: dev
+          POSTGRES_DB: aegis
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U aegis"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      DATABASE_URL: postgres://aegis:dev@localhost:5432/aegis
+      # Throwaway all-zero base64 key for CI only — NOT a real secret. Real
+      # keys come from GitHub Actions secrets / sealed secrets in deploys.
+      AUDIT_MASTER_KEY: AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=
+      # RUN_S3_INTEGRATION=1 makes the MinIO export test a hard gate: if
+      # MinIO is unreachable when this is set, the test FAILS rather than
+      # silently skipping (see test/audit-export.test.ts).
+      RUN_S3_INTEGRATION: "1"
+      EXPORT_S3_ENDPOINT: http://localhost:9000
+      EXPORT_S3_BUCKET: aegis-audit
+      EXPORT_S3_ACCESS_KEY: aegis
+      EXPORT_S3_SECRET_KEY: aegis12345
+      EXPORT_S3_REGION: us-east-1
+    steps:
+      - uses: actions/checkout@v4
+
+      # GitHub Actions `services:` containers cannot override the image
+      # command, and the official minio/minio image requires `server /data`
+      # as its command — so it can't be used as a plain services: entry.
+      # (bitnami/minio:latest, which could, no longer exists on Docker Hub —
+      # that's what broke the first CI run.) Run it as a normal step instead.
+      - name: start MinIO
+        run: |
+          docker run -d --name minio \
+            -p 9000:9000 \
+            -e MINIO_ROOT_USER=aegis \
+            -e MINIO_ROOT_PASSWORD=aegis12345 \
+            minio/minio server /data
+
+          echo "waiting for MinIO to become healthy..."
+          for i in $(seq 1 30); do
+            if curl -sf http://localhost:9000/minio/health/live > /dev/null; then
+              echo "MinIO is up after ${i}0s"
+              break
+            fi
+            if [ "$i" -eq 30 ]; then
+              echo "MinIO failed to become healthy in time"
+              docker logs minio
+              exit 1
+            fi
+            sleep 2
+          done
+
+      - name: create MinIO bucket
+        run: |
+          aws --endpoint-url http://localhost:9000 s3 mb "s3://${EXPORT_S3_BUCKET}"
+        env:
+          AWS_ACCESS_KEY_ID: aegis
+          AWS_SECRET_ACCESS_KEY: aegis12345
+          AWS_DEFAULT_REGION: us-east-1
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: install opa
+        run: |
+          curl -L -o /usr/local/bin/opa https://openpolicyagent.org/downloads/latest/opa_linux_amd64_static
+          sudo chmod +x /usr/local/bin/opa
+          opa version
+
+      - run: npm ci
+
+      - name: build (policy WASM + tsc)
+        run: npm run build
+
+      - run: npm run typecheck
+
+      - name: opa test (policy/bundle)
+        run: opa test policy/bundle -v
+
+      - name: migrate
+        run: npx drizzle-kit migrate
+
+      - name: test (vitest, serial — shared Postgres + hash chain)
+        run: npm test
+
+  gitleaks:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  # NOTE (owner action required): for this job to actually do anything, the
+  # cla-assistant GitHub App must be installed on rhinolands/aegis by an org
+  # owner (https://github.com/apps/cla-assistant), and a PERSONAL_ACCESS_TOKEN
+  # secret (a PAT with repo scope for the bot identity that signs commits/
+  # comments on PRs) must be added to the repo. Until both are done, this job
+  # is a deliberate no-op — see the gating below — rather than a permanent
+  # red X that trains contributors to ignore CI.
+  cla:
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request'
+    continue-on-error: true
+    permissions:
+      contents: write
+      pull-requests: write
+    # The `secrets` context is NOT available in step-level `if:` expressions —
+    # using it there makes GitHub reject the whole workflow file before any job
+    # starts (that is what broke run 29935052845). It IS allowed in a job-level
+    # `env:`, so map it once here and gate the steps on the env value instead.
+    env:
+      HAS_CLA_PAT: ${{ secrets.PERSONAL_ACCESS_TOKEN != '' }}
+    steps:
+      - name: CLA Assistant
+        if: env.HAS_CLA_PAT == 'true'
+        uses: contributor-assistant/github-action@v2.6.1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PERSONAL_ACCESS_TOKEN: ${{ secrets.PERSONAL_ACCESS_TOKEN }}
+        with:
+          path-to-signatures: "signatures/cla.json"
+          path-to-document: "https://github.com/rhinolands/aegis/blob/main/CLA.md"
+          branch: main
+          allowlist: dependabot[bot]
+
+      - name: CLA setup pending
+        if: env.HAS_CLA_PAT != 'true'
+        run: |
+          echo "::notice::cla-assistant is not configured yet (no PERSONAL_ACCESS_TOKEN secret) — an owner must install the GitHub App and add the secret. This job is non-blocking until then."

@@ -4,7 +4,7 @@
 
 Apache-2.0. Self-hostable: one TypeScript service + Postgres.
 
-> **Status: v0.1 in progress — 15 of 20 planned tasks complete.** The foundation, the audit spine, the policy engine, the guards, the govern pipeline, and all three mediation planes (MCP, A2A, LLM) are built and tested. What remains is packaging: object-storage export, Helm chart, the end-to-end demo script, and CI. See [What's actually built](#whats-actually-built) — that section is deliberately precise, because a governance tool that overstates its own guarantees is worse than none.
+> **Status: v0.1 complete — 20 of 20 planned tasks.** The foundation, the audit spine, the policy engine, the guards, the govern pipeline, all three mediation planes (MCP, A2A, LLM), object-storage export, the Helm chart, the end-to-end demo script, and CI are all built and tested. See [What's actually built](#whats-actually-built) — that section is deliberately precise, because a governance tool that overstates its own guarantees is worse than none.
 
 ---
 
@@ -62,7 +62,8 @@ This is the part worth reading the code for.
 
 ## What's actually built
 
-Verified by `npm test` (68 passing) and `opa test policy/bundle` (9 passing).
+Verified by `npm test` (75 passing, including the MinIO export integration test
+under `RUN_S3_INTEGRATION=1`) and `opa test policy/bundle` (9 passing).
 
 **Complete and tested**
 - Config loading with fail-fast validation; Fastify server; health endpoint
@@ -87,8 +88,11 @@ Verified by `npm test` (68 passing) and `opa test policy/bundle` (9 passing).
 
 For all three planes the upstream destination is **operator-configured, never caller-supplied** — see [why that matters](#the-destination-is-not-the-callers-to-choose).
 
-**Not yet built** (planned, tasks 16–20)
-- Daily object-storage export; bootstrap wiring + register CLI; Helm chart; end-to-end demo script; CI
+- **Object-storage export** — daily JSONL segments + sha256 manifest + chain-head pointer, written to any S3-compatible store (MinIO, S3, Azure Blob, GCS via interop endpoint)
+- **Agent registration CLI** (`scripts/register.ts`) — the only way to create an agent identity, its tool/peer/model allowlist, and its scoped backend credential; returns the raw API key exactly once
+- **Helm chart** (`helm/aegis`) — k3s-first, single replica by design (see chart comments), pre-install migration Job, MinIO as the default object store
+- **`scripts/demo.sh`** — the five-minute end-to-end walkthrough (see [Demo](#demo) below)
+- **CI** — GitHub Actions (build, typecheck, `opa test`, Postgres + MinIO integration tests, gitleaks, CLA bot) and a Forgejo `workflow_dispatch` e2e job
 
 ## The destination is not the caller's to choose
 
@@ -127,8 +131,25 @@ export AUDIT_MASTER_KEY=$(head -c32 /dev/zero | base64)   # dev only
 
 npx drizzle-kit migrate     # includes the append-only grants + trigger
 npm run build               # compiles the Rego policy to WASM, then TypeScript
-npm test                    # 24 tests
+npm test                    # unit + integration suite
 opa test policy/bundle -v   # 9 policy tests
+```
+
+The S3/MinIO export integration test only runs when `RUN_S3_INTEGRATION=1` is set
+(otherwise it reports as a real vitest **skip**, never a false pass). Run it against
+a local MinIO:
+
+```bash
+docker run -d --name aegis-minio -p 9000:9000 \
+  -e MINIO_ROOT_USER=aegis -e MINIO_ROOT_PASSWORD=aegis12345 \
+  minio/minio server /data
+
+export RUN_S3_INTEGRATION=1
+export EXPORT_S3_ENDPOINT=http://localhost:9000
+export EXPORT_S3_BUCKET=aegis-audit
+export EXPORT_S3_ACCESS_KEY=aegis
+export EXPORT_S3_SECRET_KEY=aegis12345
+npm test
 ```
 
 Migrations run with `client_min_messages=warning` (set on the connection in `drizzle.config.ts`), so the benign `does not exist, skipping` notice from the append-only migration's `DROP TRIGGER IF EXISTS` doesn't read like a failure on a fresh database. Warnings and errors still surface. It is set on the connection rather than in the migration because migrations here are append-only and are never edited once applied.
@@ -140,6 +161,52 @@ Because the tamper test deliberately breaks the chain, a *second* consecutive lo
 ```bash
 docker exec aegis-pg psql -U aegis -d aegis -c "TRUNCATE audit_records, chain_head;"
 ```
+
+## Helm (k3s-first)
+
+The chart at `helm/aegis` installs the gateway, a pre-install migration Job, and
+config/secret templates. It is deliberately single-replica for v0.1 — the rate
+limiter is in-process, not backed by shared state, so scaling replicas beyond 1
+would silently multiply the effective per-caller rate limit (see the comment
+at the top of `helm/aegis/values.yaml`).
+
+```bash
+helm install aegis ./helm/aegis \
+  --set database.url=postgres://aegis:CHANGE_ME@your-postgres:5432/aegis \
+  --set secrets.auditMasterKey=$(head -c32 /dev/zero | base64) \
+  --set secrets.s3AccessKey=CHANGE_ME \
+  --set secrets.s3SecretKey=CHANGE_ME
+```
+
+Nothing in `values.yaml` is a usable credential — secrets are placeholders,
+supplied at install time via `--set`, `--set-file`, a gitignored local values
+override, or a sealed-secrets/external-secrets pipeline. `objectStore.endpoint`
+defaults to `http://minio:9000`, matching a k3s cluster's in-namespace MinIO
+service name; swap it for S3, Azure Blob, or GCS by endpoint/region alone — no
+code change.
+
+## Demo
+
+`scripts/demo.sh` is the five-minute end-to-end proof of the whole product. It
+starts (or reuses) the echo upstream and the gateway itself, then walks through:
+
+1. Register an agent with exactly one allowlisted tool.
+2. **Allowed** tool call → `200`, and the upstream shows the gateway injected a
+   scoped backend credential the caller never held.
+3. **Unauthorized** tool call (a tool not on the allowlist) → `403`, deny logged.
+4. `verifyChain()` → **passes** against the chain built by steps 2–3.
+5. Tamper with the latest record the way an attacker holding owner-level DB
+   credentials would (disable the append-only trigger, edit, re-enable it) →
+   `verifyChain()` → **fails**, proving the edit is caught.
+
+```bash
+export DATABASE_URL=postgres://aegis:dev@localhost:5432/aegis   # dev only
+npx drizzle-kit migrate
+bash scripts/demo.sh
+```
+
+The script fails loudly (non-zero exit) the instant any step doesn't produce
+its expected outcome — it never prints success regardless of what happened.
 
 ## Notes on engineering approach
 
