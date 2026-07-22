@@ -4,7 +4,7 @@
 
 Apache-2.0. Self-hostable: one TypeScript service + Postgres.
 
-> **Status: v0.1 in progress — 12 of 20 planned tasks complete.** The foundation, the audit spine, the policy engine, the guards, and the single govern pipeline are built and tested. The three mediation planes that sit on top of the pipeline are not yet wired. See [What's actually built](#whats-actually-built) — that section is deliberately precise, because a governance tool that overstates its own guarantees is worse than none.
+> **Status: v0.1 in progress — 15 of 20 planned tasks complete.** The foundation, the audit spine, the policy engine, the guards, the govern pipeline, and all three mediation planes (MCP, A2A, LLM) are built and tested. What remains is packaging: object-storage export, Helm chart, the end-to-end demo script, and CI. See [What's actually built](#whats-actually-built) — that section is deliberately precise, because a governance tool that overstates its own guarantees is worse than none.
 
 ---
 
@@ -62,7 +62,7 @@ This is the part worth reading the code for.
 
 ## What's actually built
 
-Verified by `npm test` (48 passing) and `opa test policy/bundle` (9 passing).
+Verified by `npm test` (68 passing) and `opa test policy/bundle` (9 passing).
 
 **Complete and tested**
 - Config loading with fail-fast validation; Fastify server; health endpoint
@@ -81,9 +81,22 @@ Verified by `npm test` (48 passing) and `opa test policy/bundle` (9 passing).
 - Per-agent rate limiting (in-process sliding window) and fail-closed budget metering — an agent with no configured budget is denied, not granted unlimited spend
 - **The govern pipeline** — the single ordered enforcement path (rate → policy → budget → execute → meter + audit) that all planes reuse. Denies short-circuit before any upstream call; allows and denies are both audited; `govern()` never throws, degrading to a deterministic status instead (see [fail-closed behaviour](#fail-closed-behaviour-of-the-pipeline))
 
-**Not yet built** (planned, tasks 13–20)
-- MCP, A2A, and LLM mediation planes (the pipeline they plug into is done)
-- Daily object-storage export; Helm chart; end-to-end demo script; CI
+- **MCP plane** — `POST /mcp/:tool`, per-agent tool allowlist, scoped credential injected by the gateway into the upstream call
+- **A2A plane** — `POST /a2a/:peer`, peer allowlist, on-behalf-of delegation chain forwarded to the peer
+- **LLM plane** — `POST /llm/:model`, model allowlist, governed passthrough with token metering into the budget
+
+For all three planes the upstream destination is **operator-configured, never caller-supplied** — see [why that matters](#the-destination-is-not-the-callers-to-choose).
+
+**Not yet built** (planned, tasks 16–20)
+- Daily object-storage export; bootstrap wiring + register CLI; Helm chart; end-to-end demo script; CI
+
+## The destination is not the caller's to choose
+
+An early cut of the planes let the caller pass `upstreamUrl` in the request body. That is a credential-exfiltration hole: an authenticated agent with an allowlisted tool could point the gateway at a server it controlled and receive the injected backend secret. The agent never *holds* the credential — it just makes the gateway deliver it anywhere, which is the same thing.
+
+Destinations are now resolved server-side from the operator-registered `(agent, target)` record. The caller names a tool, peer, or model; the gateway decides where that goes, and denies fail-closed when nothing is registered. Redirects are rejected (`redirect: 'manual'`, any 3xx is an upstream failure) so a compromised upstream cannot bounce the credential onward.
+
+The same class of bug appeared once more on the LLM plane, where the caller-supplied `payload` was spread *after* the policy-gated `model`, letting a caller run a model they weren't allowlisted for — while cost was metered at the allowlisted model's rate and the audit record named the wrong model. Trusted values are now spread last. Both are locked by regression tests that were verified to fail when the fix is reverted.
 
 ## Fail-closed behaviour of the pipeline
 

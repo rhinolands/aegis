@@ -29,6 +29,11 @@ export const scopedCredentials = pgTable('scoped_credentials', {
   agentId: uuid('agent_id').notNull().references(() => agents.id),
   target: text('target').notNull(),        // e.g. 'mcp:filesystem', 'llm:anthropic'
   secretCiphertext: text('secret_ciphertext').notNull(), // encrypted at rest
+  // Operator-registered upstream destination for this (agent, target) pair.
+  // NEVER caller-supplied — resolving this server-side is what prevents an
+  // agent from redirecting its own scoped credential to an attacker-controlled
+  // host. Nullable because not every target (e.g. non-HTTP tools) has one.
+  upstreamUrl: text('upstream_url'),
   createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
 });
 
