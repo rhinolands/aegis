@@ -337,6 +337,13 @@ export function registerLlmRawPlane(app: FastifyInstance, deps: ServerDeps): voi
     const requestId = upstream.headers.get('request-id');
     if (requestId) reply.header('request-id', requestId);
 
+    // Read once, here, so the streaming branch below and the SSE writeHead that
+    // follows it agree about what the upstream actually sent. A substring check,
+    // not equality: the header routinely carries parameters
+    // (`text/event-stream; charset=utf-8`).
+    const upstreamContentType = upstream.headers.get('content-type') ?? '';
+    const upstreamIsEventStream = upstreamContentType.includes('text/event-stream');
+
     // ---------------------------------------------------------------------
     // 6. G2 — SSE PASSTHROUGH.
     //
@@ -361,8 +368,27 @@ export function registerLlmRawPlane(app: FastifyInstance, deps: ServerDeps): voi
     // non-streaming branch uses — real status, real bytes, no half-opened
     // stream. A mid-stream deny is not merely avoided here; it is made
     // structurally impossible.
+    //
+    // AND THE RESPONSE MUST ACTUALLY BE AN EVENT STREAM (WR-04). The condition
+    // used to ask only what the CALLER requested. But this branch meters from
+    // SSE frames, so a 2xx body that is not an event stream — an upstream that
+    // ignores `stream`, a caching proxy that buffers it, a future compatibility
+    // mode — produces no message_start and no message_delta, the usage
+    // accumulator stays at zero, and the turn settles `allow` with tokens 0,
+    // costMicros 0 AND NO ERROR MARKER: a fully-billed call metered at zero that
+    // looks in the audit trail exactly like a clean, cheap one. That is the same
+    // vacuous-cap failure mode `priced: false` exists to make loud, arriving by
+    // a different door.
+    //
+    // The narrowing follows the reasoning above rather than contradicting it:
+    // the point of checking everything before the first byte is that a
+    // half-opened SSE response cannot be recovered from. A response that is not
+    // an event stream simply falls through to the SAME Pattern-3 buffered relay
+    // as a non-2xx one — real status, real bytes, and metered from the body.
+    // Deliberately NOT a refusal and NOT a new gateway_code: the caller gets the
+    // upstream's own answer, which is what this route exists to deliver.
     // ---------------------------------------------------------------------
-    if ((body as { stream?: unknown }).stream === true && upstream.ok && upstream.body !== null) {
+    if ((body as { stream?: unknown }).stream === true && upstream.ok && upstream.body !== null && upstreamIsEventStream) {
       const usage: StreamUsage = { input: 0, output: 0, cacheWrite: 0, cacheRead: 0 };
 
       // SINGLE-SHOT SETTLE. A client abort racing the pipeline's rejection would
