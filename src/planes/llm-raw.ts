@@ -373,7 +373,18 @@ export function registerLlmRawPlane(app: FastifyInstance, deps: ServerDeps): voi
       const settleOnce = (error?: string): Promise<void> => {
         if (settled) return settled;
         settled = (async () => {
-          const { costMicros, priced } = priceMicros(model, usage.input, usage.output);
+          // ALL FOUR CLASSES ANTHROPIC BILLS, priced at their own rates and
+          // each rounded as its own line item (src/pricing/models.ts).
+          //
+          // The tee has ALWAYS collected cacheWrite/cacheRead — its own header
+          // called costing cached tokens at the wrong rate "a silent-money bug"
+          // — and this call site then threw them away, which was that exact bug
+          // (CR-02). usage.input_tokens EXCLUDES both cache classes, so a
+          // 200K-token prompt sent with cache_control reports ~20 input tokens
+          // against roughly $0.75 of real spend. On a passthrough route that
+          // forwards the caller's body verbatim and validates nothing but
+          // `model`, any authenticated caller can produce that shape.
+          const { costMicros, priced } = priceMicros(model, usage.input, usage.output, usage.cacheWrite, usage.cacheRead);
           if (!priced) {
             log.error(
               { model, agentId: principal.agentId },
@@ -388,7 +399,10 @@ export function registerLlmRawPlane(app: FastifyInstance, deps: ServerDeps): voi
           // closed tab all settle (RESEARCH Pitfall 9: closing the tab must not
           // be a way to get free tokens).
           const res = await governSettle(govDeps, ctx, decision, {
-            tokens: usage.input + usage.output,
+            // The TOKEN cap counts all four classes too, for the same reason the
+            // cost cap does: a cap that ignores the classes a caller can inflate
+            // at will is not a cap.
+            tokens: usage.input + usage.output + usage.cacheWrite + usage.cacheRead,
             costMicros,
             error,
           });
@@ -490,8 +504,15 @@ export function registerLlmRawPlane(app: FastifyInstance, deps: ServerDeps): voi
       return reply.code(upstream.status).type('application/json').send(text);
     }
 
-    const { input, output } = extractUsage('anthropic', parsed);
-    const { costMicros, priced } = priceMicros(model, input, output);
+    // ALL FOUR CLASSES, same as the streaming settle above. Anthropic bills
+    // input, output, cache-creation and cache-read as separate line items at
+    // their own rates, and `usage.input_tokens` excludes both cache classes —
+    // so pricing input+output alone does not under-meter a cached call
+    // slightly, it misses almost all of it (CR-02). This branch was worse than
+    // the streaming one before plan 45-12: extractUsage did not even READ the
+    // cache fields.
+    const { input, output, cacheWrite, cacheRead } = extractUsage('anthropic', parsed);
+    const { costMicros, priced } = priceMicros(model, input, output, cacheWrite, cacheRead);
     if (!priced) {
       // Error level, not debug and not a silent zero — same signal the
       // envelope plane emits. A model that policy allowlisted but the price
@@ -503,7 +524,10 @@ export function registerLlmRawPlane(app: FastifyInstance, deps: ServerDeps): voi
       );
     }
 
-    const settled = await governSettle(govDeps, ctx, decision, { tokens: input + output, costMicros });
+    const settled = await governSettle(govDeps, ctx, decision, {
+      tokens: input + output + cacheWrite + cacheRead,
+      costMicros,
+    });
     if (!settled.ok) return reply.code(settled.status).send(settled.body);
 
     return reply.code(upstream.status).type('application/json').send(text);
