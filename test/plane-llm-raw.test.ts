@@ -14,7 +14,7 @@ import { registerAgent } from '../src/identity/registry.js';
 import { putCredential } from '../src/credentials/store.js';
 import { seedBudget } from '../src/guard/budget.js';
 import { buildServer } from '../src/server.js';
-import { budgets, auditRecords } from '../src/db/schema.js';
+import { budgets, auditRecords, scopedCredentials } from '../src/db/schema.js';
 
 const cfg = loadConfig(process.env);
 let engine: PolicyEngine;
@@ -41,6 +41,18 @@ interface UpstreamOptions {
   body?: string;
   /** Convenience: respond `{"ok":true,"usage":{...}}`. */
   usage?: Record<string, unknown>;
+  /**
+   * Announce a `Content-Length` the response never delivers, then destroy the
+   * socket. `fetch()` RESOLVES (the headers arrived and the status is fixed) and
+   * `upstream.text()` REJECTS — the CR-03(b) shape, in which Anthropic has
+   * already produced and will bill a completion that Aegis can never read.
+   * Headers are flushed explicitly and the destroy is deferred a tick so the
+   * gateway is guaranteed to have a Response object before the socket dies;
+   * without that the destroy races the fetch itself and the gateway correctly
+   * answers `upstream_unreachable` from the OTHER guard, which is a different
+   * code path than the one this knob exists to exercise.
+   */
+  truncateAfterHeaders?: boolean;
 }
 
 /**
@@ -61,6 +73,16 @@ function startUpstream(opts: UpstreamOptions = {}): Promise<{ server: Server; po
         let body: unknown = {};
         try { body = raw ? JSON.parse(raw) : {}; } catch { body = raw; }
         requests.push({ method: req.method, url: req.url, headers: req.headers, raw, body });
+        if (opts.truncateAfterHeaders) {
+          res.writeHead(opts.status ?? 200, {
+            'content-type': 'application/json',
+            'content-length': '100',
+            ...(opts.headers ?? {}),
+          });
+          res.flushHeaders();
+          setTimeout(() => res.socket?.destroy(), 30);
+          return;
+        }
         const payload = opts.body ?? JSON.stringify({ ok: true, ...(opts.usage ? { usage: opts.usage } : {}) });
         res.writeHead(opts.status ?? 200, { 'content-type': 'application/json', ...(opts.headers ?? {}) });
         res.end(payload);
@@ -73,6 +95,22 @@ function startUpstream(opts: UpstreamOptions = {}): Promise<{ server: Server; po
     });
   });
 }
+
+type Db = ReturnType<typeof getDb>['db'];
+
+/**
+ * EVERY audit row carrying this correlation id — deliberately unbounded, unlike
+ * the `.limit(1)` lookups elsewhere in this file. The row COUNT is the settle
+ * count, and "exactly one record for an authorized request" is the property
+ * CR-03's guards exist to hold; a `limit(1)` query can never observe a double
+ * settle.
+ */
+async function auditFor(db: Db, correlationId: string): Promise<{ verdict: string; why: unknown }[]> {
+  return db.select().from(auditRecords)
+    .where(dsql`${auditRecords.whenWhere}->>'correlationId' = ${correlationId}`) as unknown as Promise<{ verdict: string; why: unknown }[]>;
+}
+
+const reasonOf = (row: { why: unknown }): string => String((row.why as { reason?: unknown }).reason);
 
 describe('POST /v1/messages (G1 anthropic-compat raw route)', () => {
   it('relays an allowed request to the registered upstream and returns its body byte-for-byte', async () => {
@@ -332,6 +370,112 @@ describe('POST /v1/messages (G1 anthropic-compat raw route)', () => {
       expect(record).toBeDefined();
       expect(record.verdict).toBe('allow');
       expect(String((record.why as { reason?: unknown }).reason)).toContain('upstream_error:upstream_500');
+      const [after] = await db.select().from(budgets).where(eq(budgets.agentId, agent.id)).limit(1);
+      expect(after.tokensUsed - before.tokensUsed).toBe(0);
+      expect(after.costUsedMicros - before.costUsedMicros).toBe(0);
+
+      await app.close();
+    } finally {
+      await sql.end();
+      await new Promise((r) => upstream.server.close(r));
+    }
+  });
+
+  // ---- CR-03: no authorized request may escape without an audit record ----
+  //
+  // Both tests assert an EXACT marker substring. Asserting only `upstream_error:`
+  // would prove nothing: governSettle prepends that prefix to EVERY marker it is
+  // given, so a test matching on it alone passes against any settle at all —
+  // including one recording the wrong failure.
+
+  it('audits a mid-body upstream disconnect as upstream_body_read_failed instead of escaping as an unaudited 500', async () => {
+    const { db, sql } = getDb(cfg);
+    // Content-Length announced, body never delivered, socket destroyed. The
+    // completion was produced and WILL be billed; Aegis can never read it.
+    const upstream = await startUpstream({ truncateAfterHeaders: true });
+    try {
+      const { agent, apiKey } = await registerAgent(db, { name: `llmraw-bodyfail-${Date.now()}`, tenant: 'test', allowedModels: [MODEL] });
+      await seedBudget(db, agent.id, 1_000_000, 1_000_000);
+      await putCredential(db, cfg, agent.id, 'llm:anthropic', 'anthropic-key-xyz', `http://127.0.0.1:${upstream.port}`);
+      const app = buildServer({ cfg, db, engine });
+
+      const correlationId = randomUUID();
+      const [before] = await db.select().from(budgets).where(eq(budgets.agentId, agent.id)).limit(1);
+      const res = await app.inject({
+        method: 'POST', url: '/v1/messages',
+        headers: { 'x-api-key': apiKey, 'x-correlation-id': correlationId },
+        payload: { model: MODEL, messages: [] },
+      });
+
+      // 502, not Fastify's unhandled-rejection 500.
+      expect(res.statusCode).toBe(502);
+      expect(res.statusCode).not.toBe(500);
+      const body = JSON.parse(res.body) as { type?: string; error?: { type?: string; gateway_code?: string } };
+      expect(body.error?.gateway_code).toBe('upstream_unreachable');
+      expect(body.error?.type).toBe('api_error');
+      // The upstream really was reached — this is not the fetch-rejection path.
+      expect(upstream.requests.length).toBe(1);
+
+      const rows = await auditFor(db, correlationId);
+      // EXACTLY one: the guard must not double-settle alongside another path.
+      expect(rows.length).toBe(1);
+      expect(rows[0].verdict).toBe('allow');
+      expect(reasonOf(rows[0])).toContain('upstream_body_read_failed');
+
+      // Zero, not invented usage: there are no figures to meter.
+      const [after] = await db.select().from(budgets).where(eq(budgets.agentId, agent.id)).limit(1);
+      expect(after.tokensUsed - before.tokensUsed).toBe(0);
+      expect(after.costUsedMicros - before.costUsedMicros).toBe(0);
+
+      await app.close();
+    } finally {
+      await sql.end();
+      await new Promise((r) => upstream.server.close(r));
+    }
+  });
+
+  it('audits a credential-lookup fault as credential_lookup_failed instead of escaping as an unaudited 500', async () => {
+    const { db, sql } = getDb(cfg);
+    const upstream = await startUpstream({ usage: { input_tokens: 1, output_tokens: 1 } });
+    try {
+      const { agent, apiKey } = await registerAgent(db, { name: `llmraw-credfail-${Date.now()}`, tenant: 'test', allowedModels: [MODEL] });
+      await seedBudget(db, agent.id, 1_000_000, 1_000_000);
+      // The narrowest real seam: a row whose ciphertext does not authenticate
+      // under the master key — corruption at rest, or a rotated key. Written
+      // through the schema rather than through putCredential() so the fault
+      // happens INSIDE getCredentialTarget's decrypt, which is the production
+      // code path CR-03(a) names. No stub, no module mock.
+      await db.insert(scopedCredentials).values({
+        agentId: agent.id,
+        target: 'llm:anthropic',
+        secretCiphertext: Buffer.from('corrupted-at-rest-scoped-credential-ciphertext').toString('base64'),
+        upstreamUrl: `http://127.0.0.1:${upstream.port}`,
+      });
+      const app = buildServer({ cfg, db, engine });
+
+      const correlationId = randomUUID();
+      const [before] = await db.select().from(budgets).where(eq(budgets.agentId, agent.id)).limit(1);
+      const res = await app.inject({
+        method: 'POST', url: '/v1/messages',
+        headers: { 'x-api-key': apiKey, 'x-correlation-id': correlationId },
+        payload: { model: MODEL, messages: [] },
+      });
+
+      expect(res.statusCode).toBe(502);
+      expect(res.statusCode).not.toBe(500);
+      const body = JSON.parse(res.body) as { error?: { type?: string; gateway_code?: string } };
+      expect(body.error?.gateway_code).toBe('not_provisioned');
+      expect(body.error?.type).toBe('api_error');
+      expect(res.headers['x-should-retry']).toBe('false');
+      // Nothing may reach the upstream: no destination was ever resolved.
+      expect(upstream.requests.length).toBe(0);
+
+      const rows = await auditFor(db, correlationId);
+      // preflight ALLOWED and wrote nothing; without the guard this is 0 rows.
+      expect(rows.length).toBe(1);
+      expect(rows[0].verdict).toBe('allow');
+      expect(reasonOf(rows[0])).toContain('credential_lookup_failed');
+
       const [after] = await db.select().from(budgets).where(eq(budgets.agentId, agent.id)).limit(1);
       expect(after.tokensUsed - before.tokensUsed).toBe(0);
       expect(after.costUsedMicros - before.costUsedMicros).toBe(0);
