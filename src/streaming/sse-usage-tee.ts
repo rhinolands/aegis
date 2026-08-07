@@ -45,14 +45,49 @@ export interface StreamUsage {
   cacheRead: number;
 }
 
-// Coerce every usage field through Number(...) || 0 before arithmetic. Carried
-// verbatim in intent from src/pricing/models.ts: an upstream is untrusted
-// input, and if it returns a field as a string (usage.output_tokens: "40")
-// naive `+` does string concatenation instead of addition ("40" + 60 ===
-// "4060"), silently inflating the metered token count by orders of magnitude.
-// Number(x) || 0 also turns NaN/undefined/null/non-numeric strings into 0
-// rather than propagating garbage into the meter.
-const n = (v: unknown): number => Number(v) || 0;
+// Coerce every usage field before arithmetic. Carried verbatim in intent from
+// src/pricing/models.ts: an upstream is untrusted input, and if it returns a
+// field as a string (usage.output_tokens: "40") naive `+` does string
+// concatenation instead of addition ("40" + 60 === "4060"), silently inflating
+// the metered token count by orders of magnitude. Number(x) turns
+// NaN/undefined/null/non-numeric strings into NaN, which the guard below maps
+// to 0 rather than propagating garbage into the meter.
+//
+// The upstream is OPERATOR-REGISTERED. That is an argument about who it is, not
+// about what it sends, and this coercion exists precisely because a registered
+// upstream is still not trusted to be WELL-FORMED. The previous coercion —
+// `Number(v)` with an or-zero fallback — closed the string hazard above and
+// left three others open (CR-04):
+//
+//   NEGATIVE — the one that matters, and it bites harder here than in the
+//     pricing module because message_delta usage is CUMULATIVE and therefore
+//     OVERWRITES: a frame reporting output_tokens: -1000 does not merely fail
+//     to add, it REPLACES a real accumulated 2000. planes/llm-raw.ts settles
+//     with `tokens: usage.input + usage.output` and meterUsage() then moves
+//     budgets.cost_used_micros DOWN, permanently disarming that agent's cost
+//     cap while it keeps answering "yes" to real spend.
+//   FRACTIONAL — a fraction reaches Math.round((n / 1000) * rate) downstream
+//     and produces micros never derived from a whole token.
+//   ABSURD MAGNITUDE — Number('1e308') is FINITE, so a finite-only check still
+//     admits it. Past Number.MAX_SAFE_INTEGER exact-integer arithmetic stops
+//     holding.
+//
+// So: finite, strictly positive, safely representable, floored toward zero. The
+// clamp may only ever move a reported count TOWARD zero, never away from it.
+// An out-of-range value becomes 0 rather than being clamped up to the bound —
+// metering a garbage field at MAX_SAFE_INTEGER would exhaust an honest agent's
+// budget on one malformed response, turning an upstream fault into a customer
+// outage. See src/pricing/models.ts for the full reasoning.
+//
+// DELIBERATELY DUPLICATED, NOT SHARED: this is a byte-identical copy of the
+// helper in src/pricing/models.ts. This module is a pure byte-relay and must
+// not take a dependency on the pricing module to stay that way. The two are
+// meant to be diff-able; keep them identical, and change both or neither.
+const n = (v: unknown): number => {
+  const x = Number(v);
+  if (!Number.isFinite(x) || x <= 0 || x > Number.MAX_SAFE_INTEGER) return 0;
+  return Math.floor(x);
+};
 
 /**
  * A pass-through `Transform` that relays every byte untouched while

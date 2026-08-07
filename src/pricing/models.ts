@@ -73,14 +73,57 @@ export const MODEL_PRICES: Record<string, ModelPrice> = {
   'claude-sonnet-4-6': { inputMicrosPer1K: 3000, outputMicrosPer1K: 15000 },
 };
 
-// Coerce every usage field through Number(...) || 0 before arithmetic. An
-// upstream is untrusted input: if it returns a field as a string (e.g.
-// usage.input_tokens: "40"), naive `+` does string concatenation instead of
-// addition ("40" + 60 === "4060"), silently inflating the metered token
-// count (and therefore costMicros) by orders of magnitude. Number(x) || 0
-// also turns NaN/undefined/null/non-numeric strings into 0 rather than
-// propagating garbage into the meter.
-const n = (v: unknown): number => Number(v) || 0;
+// Coerce every usage field before arithmetic. An upstream is untrusted input:
+// if it returns a field as a string (e.g. usage.input_tokens: "40"), naive `+`
+// does string concatenation instead of addition ("40" + 60 === "4060"),
+// silently inflating the metered token count (and therefore costMicros) by
+// orders of magnitude. Number(x) also turns NaN/undefined/null/non-numeric
+// strings into NaN, which the guard below maps to 0 rather than propagating
+// garbage into the meter.
+//
+// The upstream is OPERATOR-REGISTERED. That is an argument about who it is, not
+// about what it sends, and this coercion exists precisely because a registered
+// upstream is still not trusted to be WELL-FORMED. The previous coercion —
+// `Number(v)` with an or-zero fallback — closed the string hazard above and
+// left three others open (CR-04):
+//
+//   NEGATIVE — the one that matters. Number(-500000) || 0 === -500000, and so
+//     does the string form. A negative count CREDITS the meter: priceMicros()
+//     returns a negative costMicros, governSettle() hands it to
+//     meterUsage(db, agentId, tokens, costMicros), and budgets.cost_used_micros
+//     goes DOWN. One response reporting output_tokens: -1e9 on Sonnet credits
+//     15,000,000,000 micros and permanently disarms that agent's cost cap,
+//     which then keeps answering "yes" while real money is spent. A meter that
+//     can run backwards is worse than no meter, because it looks correct.
+//   FRACTIONAL — 12000.7 flows into Math.round((input / 1000) * rate) and
+//     produces micros that were never derived from a whole token.
+//   ABSURD MAGNITUDE — Number('1e308') is FINITE, so a finite-only check still
+//     admits it. Past Number.MAX_SAFE_INTEGER the exact-integer arithmetic this
+//     meter is built on stops holding.
+//
+// So: finite, strictly positive, safely representable, floored toward zero.
+// The clamp may only ever move a reported count TOWARD zero, never away from
+// it — that is the single property that makes the meter monotonic.
+//
+// Why an out-of-range value becomes 0 and is not clamped UP to the bound: a
+// value we have decided is not a real token count should not be allowed to
+// pick a number for us. Metering a garbage field as MAX_SAFE_INTEGER would
+// instantly and permanently exhaust an honest agent's budget on one malformed
+// response — turning an upstream fault into a customer outage. Zero loses the
+// metering for that one response, which is the same disposition this helper
+// already takes for undefined/null/NaN. Plausibility bounds (a real turn is
+// nowhere near 2^53 tokens) belong to the budget cap, not to a type coercion;
+// the bound here is about representability only.
+//
+// DELIBERATELY DUPLICATED, NOT SHARED: src/streaming/sse-usage-tee.ts carries a
+// byte-identical copy of this function. The tee is a pure byte-relay module and
+// must not take a dependency on the pricing module to stay that way. The two
+// are meant to be diff-able; keep them identical, and change both or neither.
+const n = (v: unknown): number => {
+  const x = Number(v);
+  if (!Number.isFinite(x) || x <= 0 || x > Number.MAX_SAFE_INTEGER) return 0;
+  return Math.floor(x);
+};
 
 /**
  * Widened form of the old `extractTokens`, which returned ONE summed number
@@ -120,11 +163,19 @@ export function priceMicros(
 ): { costMicros: number; priced: boolean } {
   const price = MODEL_PRICES[model];
   if (!price) return { costMicros: 0, priced: false };
+  // Clamp HERE too, not only in extractUsage. This function is public and its
+  // arguments arrive from call sites that did their own accumulation (the
+  // streaming settle in planes/llm-raw.ts sums tee-accumulated fields), so it
+  // cannot assume its inputs already went through n(). Clamping at the
+  // arithmetic itself is what makes "costMicros is never negative" a property
+  // of this function rather than a property of its callers' discipline.
+  const i = n(input);
+  const o = n(output);
   // Each side is rounded INDEPENDENTLY and then summed — deliberately, not as
   // a rounding of the sum. The two are not the same number in general, and the
   // per-side form is what the worked example in test/pricing.test.ts pins.
   const costMicros =
-    Math.round((input / 1000) * price.inputMicrosPer1K) +
-    Math.round((output / 1000) * price.outputMicrosPer1K);
+    Math.round((i / 1000) * price.inputMicrosPer1K) +
+    Math.round((o / 1000) * price.outputMicrosPer1K);
   return { costMicros, priced: true };
 }
