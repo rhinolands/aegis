@@ -10,10 +10,22 @@
  * wrong spend is worse than one that never trips, because it looks correct.
  */
 
-/** Two rates, never one. `inputMicrosPer1K` and `outputMicrosPer1K` are both micros per 1,000 tokens. */
+/**
+ * Four rates, never one, and never two. Every field is micros per 1,000 tokens.
+ *
+ * Anthropic bills four distinct token classes and `usage.input_tokens` EXCLUDES
+ * both cache classes, so pricing only input and output does not under-meter a
+ * cached call slightly — it misses almost all of it (CR-02).
+ *
+ * `cacheWriteMicrosPer1K` is the FIVE-MINUTE cache write. See the WHICH CACHE
+ * WRITE note in the verified block below for why, and for the one case this
+ * under-meters.
+ */
 export interface ModelPrice {
   inputMicrosPer1K: number;
   outputMicrosPer1K: number;
+  cacheWriteMicrosPer1K: number;
+  cacheReadMicrosPer1K: number;
 }
 
 // [VERIFIED 2026-08-07 — primary source: Anthropic official pricing docs,
@@ -47,6 +59,57 @@ export interface ModelPrice {
 //  batch rows (Sonnet $1.50/$7.50, Haiku $0.50/$2.50) are exactly 50% of the
 //  standard rows, an internal consistency check on both readings.]
 //
+// [VERIFIED 2026-08-07 — CACHE MULTIPLIERS, primary source: the same Anthropic
+//  pricing page (https://platform.claude.com/docs/en/about-claude/pricing),
+//  section "Feature-specific pricing > Prompt caching", fetched 2026-08-07.
+//  Quoted verbatim from the multiplier table:
+//
+//    "Prompt caching uses the following pricing multipliers relative to base
+//     input token rates:
+//       5-minute cache write   1.25x base input price
+//       1-hour cache write     2x base input price
+//       Cache read (hit)       0.1x base input price"
+//
+//  Second, independent source: the OpenRouter public model API
+//  (https://openrouter.ai/api/v1/models), fetched 2026-08-07, which publishes
+//  ABSOLUTE per-token cache figures rather than multipliers — so it is a real
+//  cross-check of the arithmetic, not a restatement of it:
+//
+//    anthropic/claude-sonnet-4.6  input_cache_write 0.00000375  input_cache_read 0.0000003
+//    anthropic/claude-haiku-4.5   input_cache_write 0.00000125  input_cache_read 0.0000001
+//
+//  Cross-check (the two sources agree exactly):
+//    Sonnet write  0.00000375 / 0.000003 = 1.25x   read 0.0000003 / 0.000003 = 0.10x
+//    Haiku  write  0.00000125 / 0.000001 = 1.25x   read 0.0000001 / 0.000001 = 0.10x
+//  OpenRouter's input_cache_write_1h (Sonnet 0.000006, Haiku 0.000002) is 2.00x
+//  on both rows, matching the primary source's 1-hour figure as well.
+//
+//  Derivation into this table's units, same x1000 rule as the base rates:
+//
+//    Sonnet 4.6  input 3000  ->  write 3000 x 1.25 = 3750   read 3000 x 0.10 = 300
+//    Haiku 4.5   input 1000  ->  write 1000 x 1.25 = 1250   read 1000 x 0.10 = 100
+//
+//      check against the absolute source: $3.75/MTok x 1000 = 3,750 micros/1K
+//      and $0.30/MTok x 1000 = 300 micros/1K. Both agree with the multiplier
+//      derivation, so the figures are confirmed two ways.
+//
+//  Meter-unit sanity check, again (this repo shipped a x730 unit bug once): a
+//  200,000-token cache write on Sonnet is 200000/1000 x 3750 = 750,000 micros
+//  = $0.75. That is the CR-02 scenario, and $0.75 is what 200K tokens at
+//  $3.75/MTok should cost. If a future edit makes this figure come out at $750
+//  or $0.00075 the unit has been dropped or added somewhere.
+//
+//  WHICH CACHE WRITE — a KNOWN, DELIBERATE, CONSERVATIVE UNDER-METER. Anthropic
+//  bills a 1-hour cache write at 2x, not 1.25x, but the top-level
+//  `cache_creation_input_tokens` field this module is fed does not say which
+//  TTL produced it (the per-TTL split lives in a separate `cache_creation`
+//  breakdown object that neither the tee nor extractUsage reads today). We
+//  price the 5-minute rate because it is the default TTL. A caller using the
+//  1-hour TTL is therefore metered at 1.25x while being billed 2x — a 1.6x
+//  under-meter on that class only. This is recorded rather than hidden: it is
+//  strictly better than the 0x it replaces, and closing it means reading the
+//  per-TTL breakdown, which is a separate change with its own test.
+//
 //  RE-VERIFY OBLIGATION: before any figure derived from this table is shown to
 //  a user, put on an invoice, or used to justify a budget cap to an operator,
 //  re-check both sources and update the date above. Anthropic has repriced
@@ -68,10 +131,28 @@ export interface ModelPrice {
 //  this key and would fall through to `priced: false`. The structural guard
 //  for that is plan 45-02's `scripts/update-agent.ts`, which refuses to put a
 //  model into an agent's allowlist unless it has a MODEL_PRICES entry.
-export const MODEL_PRICES: Record<string, ModelPrice> = {
-  'claude-haiku-4-5-20251001': { inputMicrosPer1K: 1000, outputMicrosPer1K: 5000 },
-  'claude-sonnet-4-6': { inputMicrosPer1K: 3000, outputMicrosPer1K: 15000 },
-};
+//
+//  FROZEN AT BOTH LEVELS (WR-10). `const` binds the reference, not the
+//  contents: without Object.freeze any importer could run
+//  MODEL_PRICES['claude-sonnet-4-6'].outputMicrosPer1K = 0 and silently zero
+//  the cost side of every subsequent meter in that process. Nothing would
+//  notice — the table-shape tests read this object at test time, not in the
+//  running server. Everything else in this comment block treats the table as a
+//  security-relevant constant; the type and the object now agree.
+export const MODEL_PRICES: Readonly<Record<string, Readonly<ModelPrice>>> = Object.freeze({
+  'claude-haiku-4-5-20251001': Object.freeze({
+    inputMicrosPer1K: 1000,
+    outputMicrosPer1K: 5000,
+    cacheWriteMicrosPer1K: 1250,
+    cacheReadMicrosPer1K: 100,
+  }),
+  'claude-sonnet-4-6': Object.freeze({
+    inputMicrosPer1K: 3000,
+    outputMicrosPer1K: 15000,
+    cacheWriteMicrosPer1K: 3750,
+    cacheReadMicrosPer1K: 300,
+  }),
+});
 
 // Coerce every usage field before arithmetic. An upstream is untrusted input:
 // if it returns a field as a string (e.g. usage.input_tokens: "40"), naive `+`
@@ -129,25 +210,52 @@ const n = (v: unknown): number => {
  * Widened form of the old `extractTokens`, which returned ONE summed number
  * and so made split-rate pricing impossible at the call site.
  *
- * Anthropic style reads `usage.input_tokens` / `usage.output_tokens`.
+ * Anthropic style reads `usage.input_tokens` / `usage.output_tokens`, plus the
+ * two cache counters `cache_creation_input_tokens` and
+ * `cache_read_input_tokens`. Those two were previously not read AT ALL, which
+ * made the buffered path blind to the majority of a cached call's real cost:
+ * `usage.input_tokens` EXCLUDES both cache classes, so a 200,000-token prompt
+ * sent with `cache_control` reports about 20 input tokens (CR-02).
+ *
  * OpenAI style reads `usage.prompt_tokens` / `usage.completion_tokens`, and
  * falls back to `usage.total_tokens` as `input` with `output` 0 — preserving
  * the envelope plane's pre-split behaviour for openai-style upstreams rather
- * than silently metering them at zero.
+ * than silently metering them at zero. Its cache fields are always 0: OpenAI
+ * reports cached tokens differently (nested under
+ * `prompt_tokens_details.cached_tokens`, and as a DISCOUNT rather than a
+ * separately-billed class), so mapping it onto Anthropic's two-class shape here
+ * would be inventing a rate. Returning 0 is honest; the openai style is not on
+ * the metered path today, and wiring it is a separate change with its own
+ * sources.
+ *
+ * The return type is ADDITIVE — `input` and `output` keep their meaning — so
+ * existing destructuring call sites keep compiling untouched.
  */
 export function extractUsage(
   style: 'anthropic' | 'openai',
   body: unknown,
-): { input: number; output: number } {
+): { input: number; output: number; cacheWrite: number; cacheRead: number } {
   const u = (body as { usage?: Record<string, unknown> } | null | undefined)?.usage;
-  if (!u) return { input: 0, output: 0 };
-  if (style === 'anthropic') return { input: n(u.input_tokens), output: n(u.output_tokens) };
-  if (u.total_tokens != null) return { input: n(u.total_tokens), output: 0 };
-  return { input: n(u.prompt_tokens), output: n(u.completion_tokens) };
+  if (!u) return { input: 0, output: 0, cacheWrite: 0, cacheRead: 0 };
+  if (style === 'anthropic') {
+    return {
+      input: n(u.input_tokens),
+      output: n(u.output_tokens),
+      cacheWrite: n(u.cache_creation_input_tokens),
+      cacheRead: n(u.cache_read_input_tokens),
+    };
+  }
+  if (u.total_tokens != null) return { input: n(u.total_tokens), output: 0, cacheWrite: 0, cacheRead: 0 };
+  return {
+    input: n(u.prompt_tokens),
+    output: n(u.completion_tokens),
+    cacheWrite: 0,
+    cacheRead: 0,
+  };
 }
 
 /**
- * Cost of a call, in micros, from its input and output token counts.
+ * Cost of a call, in micros, from its four billed token counts.
  *
  * `priced` is what replaces the old `?? 0` fallthrough. A model that is
  * allowlisted but absent from MODEL_PRICES used to meter $0 forever with no
@@ -155,11 +263,19 @@ export function extractUsage(
  * 0 in that case — throwing would turn a pricing-table gap into a user-visible
  * refusal, a worse failure than an audited zero — but it says so, and the
  * caller is responsible for making it loud.
+ *
+ * `cacheWrite` and `cacheRead` are OPTIONAL and default to 0 so that the
+ * three-argument form keeps behaving exactly as it did: planes/llm.ts and
+ * planes/llm-raw.ts still call it that way and are rewired by plan 45-13, not
+ * here. A three-arg call is only correct for a turn with no cache tokens, which
+ * is why the two settle sites are a follow-up rather than optional.
  */
 export function priceMicros(
   model: string,
   input: number,
   output: number,
+  cacheWrite = 0,
+  cacheRead = 0,
 ): { costMicros: number; priced: boolean } {
   const price = MODEL_PRICES[model];
   if (!price) return { costMicros: 0, priced: false };
@@ -171,11 +287,18 @@ export function priceMicros(
   // of this function rather than a property of its callers' discipline.
   const i = n(input);
   const o = n(output);
-  // Each side is rounded INDEPENDENTLY and then summed — deliberately, not as
+  const cw = n(cacheWrite);
+  const cr = n(cacheRead);
+  // Each term is rounded INDEPENDENTLY and then summed — deliberately, not as
   // a rounding of the sum. The two are not the same number in general, and the
-  // per-side form is what the worked example in test/pricing.test.ts pins.
+  // per-side form is what the worked examples in test/pricing.test.ts pin. The
+  // same reasoning applies unchanged to the two cache terms: they are billed as
+  // separate line items at their own rates, so they are rounded as separate
+  // line items.
   const costMicros =
     Math.round((i / 1000) * price.inputMicrosPer1K) +
-    Math.round((o / 1000) * price.outputMicrosPer1K);
+    Math.round((o / 1000) * price.outputMicrosPer1K) +
+    Math.round((cw / 1000) * price.cacheWriteMicrosPer1K) +
+    Math.round((cr / 1000) * price.cacheReadMicrosPer1K);
   return { costMicros, priced: true };
 }

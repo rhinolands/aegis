@@ -33,10 +33,20 @@ import { Transform, type TransformCallback } from 'node:stream';
 /**
  * Token usage accumulated from an in-flight Anthropic SSE stream.
  *
- * `cacheWrite` / `cacheRead` are read even though Acme sends no `cache_control`
- * today (verified by negative grep over packages/advisor), so they will be 0.
- * They are captured anyway because costing cached tokens at the wrong rate
- * later is a silent-money bug, and the fields are free to add now.
+ * `cacheWrite` / `cacheRead` are BILLED CLASSES, not diagnostics. Anthropic's
+ * `usage.input_tokens` EXCLUDES both of them, so a turn whose prompt carried
+ * `cache_control` reports a tiny input count for a very large real spend.
+ * src/pricing/models.ts prices all four classes at their own verified rates.
+ *
+ * The justification these fields used to carry — "Acme sends no cache_control
+ * today, verified by negative grep over packages/advisor" — was retired by
+ * CR-02, and it is worth saying why so it is not reinstated. It described the
+ * wrong trust boundary. planes/llm-raw.ts is a PASSTHROUGH: it forwards
+ * `req.rawLlmBody` verbatim and validates nothing but `model`, and the
+ * allowlist keys on `request.model` rather than on body shape. Any
+ * authenticated caller — including the non-Acme consumers a vendor-neutral
+ * gateway exists to serve — can put `cache_control` in its own body today. What
+ * Acme's own client happens to send constrains nothing.
  */
 export interface StreamUsage {
   input: number;
