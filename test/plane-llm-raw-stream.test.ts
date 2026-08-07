@@ -297,6 +297,65 @@ describe('POST /v1/messages with stream: true (G2 SSE passthrough)', () => {
     }
   });
 
+  it('meters the cache classes a streamed message_start reports: 1,000 in + 500 out + 2,000 write + 4,000 read costs 19,200 micros', async () => {
+    const { db, sql } = getDb(cfg);
+    // The tee has always collected cacheWrite/cacheRead; the settle site used to
+    // throw them away. A caller can put cache_control in its own body on this
+    // passthrough route, so this is reachable today, not hypothetical.
+    const upstream = await startStreamUpstream({
+      frames: [
+        frame('message_start', {
+          type: 'message_start',
+          message: {
+            id: 'msg_cache', type: 'message', role: 'assistant', content: [],
+            usage: {
+              input_tokens: 1000,
+              output_tokens: 0,
+              cache_creation_input_tokens: 2000,
+              cache_read_input_tokens: 4000,
+            },
+          },
+        }),
+        textDelta('cached'),
+        frame('message_delta', { type: 'message_delta', delta: { stop_reason: 'end_turn' }, usage: { output_tokens: 500 } }),
+        STOP,
+      ],
+    });
+    const app = buildServer({ cfg, db, engine });
+    try {
+      const { agent, apiKey } = await registerAgent(db, { name: `rawstream-cache-${Date.now()}`, tenant: 'test', allowedModels: [MODEL] });
+      await seedBudget(db, agent.id, 1_000_000, 1_000_000);
+      await putCredential(db, cfg, agent.id, 'llm:anthropic', 'anthropic-key-xyz', `http://127.0.0.1:${upstream.port}`);
+      const base = await app.listen({ port: 0, host: '127.0.0.1' });
+
+      const correlationId = randomUUID();
+      const before = await budgetOf(db, agent.id);
+      const res = await fetch(`${base}/v1/messages`, {
+        method: 'POST',
+        headers: { 'x-api-key': apiKey, 'content-type': 'application/json', 'x-correlation-id': correlationId },
+        body: JSON.stringify({ model: MODEL, stream: true, messages: [] }),
+      });
+      expect(res.status).toBe(200);
+      await res.arrayBuffer();
+      expect((await waitForAudit(db, correlationId)).length).toBe(1);
+      const after = await budgetOf(db, agent.id);
+
+      // Identical arithmetic to the buffered four-class test:
+      //   1,000 / 1000 x  3,000 =  3,000   500 / 1000 x 15,000 =  7,500
+      //   2,000 / 1000 x  3,750 =  7,500 4,000 / 1000 x    300 =  1,200
+      //                                            total = 19,200 micros
+      expect(after.tokensUsed - before.tokensUsed).toBe(7500);
+      expect(after.tokensUsed - before.tokensUsed).not.toBe(1500);
+      expect(after.costUsedMicros - before.costUsedMicros).toBe(19200);
+      // The two-class regression: input + output only.
+      expect(after.costUsedMicros - before.costUsedMicros).not.toBe(10500);
+    } finally {
+      await app.close();
+      await sql.end();
+      await new Promise((r) => upstream.server.close(r));
+    }
+  });
+
   it('treats message_delta output_tokens as CUMULATIVE: 500, 1200, 2000 meters 2,000 — not 3,700', async () => {
     const { db, sql } = getDb(cfg);
     const upstream = await startStreamUpstream({

@@ -253,6 +253,95 @@ describe('POST /v1/messages (G1 anthropic-compat raw route)', () => {
     }
   });
 
+  // ---- CR-02: all four billed token classes reach the meter ----
+
+  it('meters all FOUR billed classes: 1,000 in + 500 out + 2,000 cache-write + 4,000 cache-read costs exactly 19,200 micros', async () => {
+    const { db, sql } = getDb(cfg);
+    const upstream = await startUpstream({
+      usage: {
+        input_tokens: 1000,
+        output_tokens: 500,
+        cache_creation_input_tokens: 2000,
+        cache_read_input_tokens: 4000,
+      },
+    });
+    try {
+      const { agent, apiKey } = await registerAgent(db, { name: `llmraw-4class-${Date.now()}`, tenant: 'test', allowedModels: [MODEL] });
+      await seedBudget(db, agent.id, 1_000_000, 1_000_000);
+      await putCredential(db, cfg, agent.id, 'llm:anthropic', 'anthropic-key-xyz', `http://127.0.0.1:${upstream.port}`);
+      const app = buildServer({ cfg, db, engine });
+
+      const [before] = await db.select().from(budgets).where(eq(budgets.agentId, agent.id)).limit(1);
+      const res = await app.inject({
+        method: 'POST', url: '/v1/messages',
+        headers: { 'x-api-key': apiKey },
+        payload: { model: MODEL, max_tokens: 16, messages: [] },
+      });
+      expect(res.statusCode).toBe(200);
+      const [after] = await db.select().from(budgets).where(eq(budgets.agentId, agent.id)).limit(1);
+
+      // The token cap counts every class Anthropic bills, not just two of them.
+      expect(after.tokensUsed - before.tokensUsed).toBe(7500);
+      expect(after.tokensUsed - before.tokensUsed).not.toBe(1500);
+      // Four independently-rounded terms, quoted so a reviewer re-derives it:
+      //   1,000 / 1000 x  3,000 =  3,000 micros of input
+      //     500 / 1000 x 15,000 =  7,500 micros of output
+      //   2,000 / 1000 x  3,750 =  7,500 micros of cache write
+      //   4,000 / 1000 x    300 =  1,200 micros of cache read
+      //                    total = 19,200 micros
+      expect(after.costUsedMicros - before.costUsedMicros).toBe(19200);
+      // The two-class regression this test exists to catch: 3,000 + 7,500.
+      expect(after.costUsedMicros - before.costUsedMicros).not.toBe(10500);
+
+      await app.close();
+    } finally {
+      await sql.end();
+      await new Promise((r) => upstream.server.close(r));
+    }
+  });
+
+  it('CR-02 scenario: a body reporting 20 input tokens with 200,000 cache-creation tokens is NOT metered as 20 tokens of spend', async () => {
+    const { db, sql } = getDb(cfg);
+    // The shape of a 200K-token prompt sent with cache_control. Anthropic's
+    // usage.input_tokens EXCLUDES the cache classes, so the honest-looking
+    // `input_tokens: 20` is the whole of what the old two-class settle saw.
+    const upstream = await startUpstream({
+      usage: { input_tokens: 20, output_tokens: 0, cache_creation_input_tokens: 200000 },
+    });
+    try {
+      const { agent, apiKey } = await registerAgent(db, { name: `llmraw-cr02-${Date.now()}`, tenant: 'test', allowedModels: [MODEL] });
+      await seedBudget(db, agent.id, 10_000_000, 10_000_000);
+      await putCredential(db, cfg, agent.id, 'llm:anthropic', 'anthropic-key-xyz', `http://127.0.0.1:${upstream.port}`);
+      const app = buildServer({ cfg, db, engine });
+
+      const [before] = await db.select().from(budgets).where(eq(budgets.agentId, agent.id)).limit(1);
+      const res = await app.inject({
+        method: 'POST', url: '/v1/messages',
+        headers: { 'x-api-key': apiKey },
+        payload: { model: MODEL, max_tokens: 16, messages: [] },
+      });
+      expect(res.statusCode).toBe(200);
+      const [after] = await db.select().from(budgets).where(eq(budgets.agentId, agent.id)).limit(1);
+
+      const costDelta = after.costUsedMicros - before.costUsedMicros;
+      // A LOWER BOUND, deliberately: this test pins that the cache class is
+      // metered at all, and must not re-pin the rate — the rate is
+      // test/pricing.test.ts's business, and duplicating it here would mean two
+      // places to update and one of them silently wrong.
+      expect(costDelta).toBeGreaterThan(500_000);
+      // What the two-class settle metered: 20/1000 x 3,000 = 60 micros against
+      // roughly 750,000 micros of real spend.
+      expect(costDelta).not.toBe(60);
+      expect(after.tokensUsed - before.tokensUsed).toBe(200020);
+      expect(after.tokensUsed - before.tokensUsed).not.toBe(20);
+
+      await app.close();
+    } finally {
+      await sql.end();
+      await new Promise((r) => upstream.server.close(r));
+    }
+  });
+
   // ---- status relay: one test per row of RESEARCH §1.5's collapse table ----
 
   it('relays an upstream 400 as 400 with its body — never collapsed into 403', async () => {
