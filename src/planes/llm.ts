@@ -7,6 +7,8 @@ import { authenticate, AuthError } from '../auth/authenticate.js';
 import { agents } from '../db/schema.js';
 import { getCredentialTarget } from '../credentials/store.js';
 import { govern } from '../pipeline/govern.js';
+import { extractUsage, priceMicros } from '../pricing/models.js';
+import { log } from '../log.js';
 
 // upstreamUrl is deliberately NOT part of this schema — same reasoning as the
 // MCP plane (src/planes/mcp.ts) and the A2A plane (src/planes/a2a.ts):
@@ -26,36 +28,13 @@ const bodySchema = z.object({
   upstreamStyle: z.enum(['anthropic', 'openai']),
 });
 
-// [UNVERIFIED] Illustrative placeholder pricing ONLY. These per-1k-token
-// micros figures are NOT sourced from any vendor price list and must never be
-// presented to a user or used for real billing as-is. Before this table
-// drives any user-visible cost figure or invoice, replace every entry with
-// per-model pricing verified against >=2 independent primary sources (the
-// vendor's own published pricing page/API, cross-checked against a second
-// source), and sanity-check the resulting math against the meter's actual
-// units (per-token vs per-1k vs per-1M) per Acme's no-naked-numbers rule.
-// Shipping this table unchanged into a cost report would misrepresent an
-// invented number as fact.
-const COST_MICROS_PER_1K: Record<string, number> = {
-  'claude-sonnet-5': 3000,
-  'claude-opus-4-8': 15000,
-};
-
-// Coerce every usage field through Number(...) || 0 before arithmetic. An
-// upstream is untrusted input: if it returns a field as a string (e.g.
-// usage.input_tokens: "40"), naive `+` does string concatenation instead of
-// addition ("40" + 60 === "4060"), silently inflating the metered token
-// count (and therefore costMicros) by orders of magnitude. Number(x) || 0
-// also turns NaN/undefined/null/non-numeric strings into 0 rather than
-// propagating garbage into the meter.
-function extractTokens(style: 'anthropic' | 'openai', body: unknown): number {
-  const u = (body as { usage?: Record<string, unknown> } | null | undefined)?.usage;
-  if (!u) return 0;
-  const n = (v: unknown): number => Number(v) || 0;
-  if (style === 'anthropic') return n(u.input_tokens) + n(u.output_tokens);
-  if (u.total_tokens != null) return n(u.total_tokens);
-  return n(u.prompt_tokens) + n(u.completion_tokens);
-}
+// Pricing and usage extraction moved to ../pricing/models.ts. The table that
+// used to live here stored ONE rate per model and applied it to input+output
+// summed; both models Acme sends are priced with output at 5x input, so no
+// single blended number could be correct. The replacement is verified against
+// the vendor's published pricing plus an independent second source, and it
+// carries the same Number(x) || 0 untrusted-upstream coercion this file used
+// to own.
 
 export function registerLlmPlane(app: FastifyInstance, deps: ServerDeps): void {
   app.post('/llm/:model', async (req, reply) => {
@@ -144,8 +123,28 @@ export function registerLlmPlane(app: FastifyInstance, deps: ServerDeps): void {
         }
         const body = await upstream.json().catch(() => ({}));
         if (!upstream.ok) throw new Error(`upstream ${upstream.status}`);
-        const tokens = extractTokens(upstreamStyle, body);
-        const costMicros = Math.round((tokens / 1000) * (COST_MICROS_PER_1K[model] ?? 0));
+        const { input, output } = extractUsage(upstreamStyle, body);
+        // Metered tokens stay input+output, exactly as before the split — the
+        // budget's token meter is one number. Only the COST arithmetic gains
+        // two sides.
+        const tokens = input + output;
+        const { costMicros, priced } = priceMicros(model, input, output);
+        if (!priced) {
+          // Error level, not debug and not a silent zero: a model that policy
+          // allowlisted but the price table does not know meters $0 forever,
+          // which makes a cost cap vacuous while looking like it works. The
+          // structural prevention — refusing to allowlist a model that has no
+          // price entry — lands in plan 45-02's scripts/update-agent.ts; this
+          // log is the detection that has to exist until then.
+          //
+          // Deliberately does NOT throw. A throw here is caught by govern()
+          // and becomes a user-visible 403, turning a pricing-table gap into a
+          // refused request — a worse failure than an audited zero-cost call.
+          log.error(
+            { model, agentId: principal.agentId },
+            'unpriced_model: allowlisted model has no MODEL_PRICES entry — cost metered as 0',
+          );
+        }
         return { tokens, costMicros, body };
       },
     );
