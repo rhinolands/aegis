@@ -71,6 +71,67 @@ describe('extractUsage — untrusted upstream coercion', () => {
   });
 });
 
+// ---------------------------------------------------------------------------
+// CR-04. The coercion above this line was written for ONE hazard — a string
+// usage field being `+`-concatenated instead of added. `Number(v) || 0` closes
+// that hazard and no other. These cases are the three it left open, and the
+// direction that matters is CREDIT: a meter that can move backwards is worse
+// than no meter, because `ensureBudget` keeps saying yes while real money is
+// spent. Every assertion below FAILS against `Number(v) || 0`.
+// ---------------------------------------------------------------------------
+describe('the usage clamp — an upstream can never credit or overflow the meter', () => {
+  it('never lets a negative output count subtract from the input term', () => {
+    // Number(-1_000_000) || 0 === -1_000_000. Unclamped this is
+    // 3000 + Math.round(-1000 * 15000) = -14,997,000 micros, and meterUsage()
+    // subtracts it from cost_used_micros — one response permanently disarming
+    // the agent's cost cap.
+    expect(priceMicros('claude-sonnet-4-6', 1_000, -1_000_000).costMicros).toBe(3_000);
+    // Nothing an upstream reports can make a priced call cost less than nothing.
+    expect(priceMicros('claude-sonnet-4-6', -5, -5).costMicros).toBe(0);
+    expect(priceMicros('claude-haiku-4-5-20251001', -1e9, 1_000).costMicros).toBe(5_000);
+  });
+
+  it('zeroes a negative token count and a non-numeric string in extractUsage', () => {
+    const u = extractUsage('anthropic', { usage: { input_tokens: -5, output_tokens: 'NaN' } });
+    expect(u.input).toBe(0);
+    expect(u.output).toBe(0);
+    // The openai style reads different field names and must carry the same rule.
+    expect(extractUsage('openai', { usage: { prompt_tokens: -1, completion_tokens: -2 } }).input).toBe(0);
+    expect(extractUsage('openai', { usage: { total_tokens: -30 } }).input).toBe(0);
+  });
+
+  it('floors a fractional count rather than rounding it or passing it through', () => {
+    // A fraction flows into Math.round((input/1000) * rate) and yields micros
+    // that were never derived from a whole token. Floor, not round: the clamp
+    // may only ever move a count toward zero, never away from it.
+    const u = extractUsage('anthropic', { usage: { input_tokens: 12_000.7, output_tokens: 0 } });
+    expect(u.input).toBe(12_000);
+    expect(u.input).not.toBe(12_001);
+    expect(Number.isInteger(u.input)).toBe(true);
+    // 0.7 of a token is not a token.
+    expect(extractUsage('anthropic', { usage: { input_tokens: 0.7 } }).input).toBe(0);
+  });
+
+  it('zeroes Infinity and an absurd finite magnitude instead of metering a huge number', () => {
+    // Number('1e308') is FINITE, so a finite-only check still lets it through —
+    // and 1e308 is far past Number.MAX_SAFE_INTEGER, where the integer
+    // arithmetic this meter depends on stops being exact.
+    expect(extractUsage('anthropic', { usage: { input_tokens: Infinity } }).input).toBe(0);
+    expect(extractUsage('anthropic', { usage: { input_tokens: '1e308' } }).input).toBe(0);
+    expect(extractUsage('anthropic', { usage: { output_tokens: -Infinity } }).output).toBe(0);
+    expect(priceMicros('claude-sonnet-4-6', Number.MAX_VALUE, 0).costMicros).toBe(0);
+  });
+
+  it('still coerces a plain numeric string — the clamp does not regress the hazard it extends', () => {
+    // The original reason n() exists. If this breaks, the fix traded one
+    // silent-money bug for another.
+    const u = extractUsage('anthropic', { usage: { input_tokens: '40', output_tokens: '60' } });
+    expect(u.input).toBe(40);
+    expect(u.output).toBe(60);
+    expect(priceMicros('claude-sonnet-4-6', 12_000, 2_000).costMicros).toBe(66_000);
+  });
+});
+
 describe('MODEL_PRICES — table shape invariants', () => {
   it('contains exactly the two model ids Acme sends, and nothing else', () => {
     // A placeholder row reappearing (claude-sonnet-5 / claude-opus-4-8, both

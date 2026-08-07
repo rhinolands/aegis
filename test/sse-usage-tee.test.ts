@@ -154,6 +154,46 @@ describe('makeUsageTee', () => {
     expect(usage.input + usage.output).not.toBe('4040');
   });
 
+  it('applies the same clamp as src/pricing/models.ts — a negative or absurd count can never move usage backwards', async () => {
+    // CR-04, tee half. The two n() helpers are deliberately duplicated in
+    // lockstep; this is the test that they have not drifted. A message_delta
+    // OVERWRITES output (it is cumulative), so an unclamped -1000 does not just
+    // fail to add — it replaces a real 2000 with a negative, and llm-raw.ts
+    // hands `usage.input + usage.output` straight to meterUsage().
+    const sse =
+      MESSAGE_START +
+      frame('message_delta', { type: 'message_delta', delta: {}, usage: { output_tokens: 2000 } }) +
+      frame('message_delta', { type: 'message_delta', delta: { stop_reason: 'end_turn' }, usage: { output_tokens: -1000 } }) +
+      frame('message_stop', { type: 'message_stop' });
+    const input = Buffer.from(sse, 'utf8');
+
+    const { out, usage } = await run([input]);
+
+    // Byte fidelity is untouched by the clamp: the hostile frame still reaches
+    // the client exactly as it arrived.
+    expect(out.equals(input)).toBe(true);
+    expect(usage.output).not.toBe(-1000);
+    expect(usage.output).toBeGreaterThanOrEqual(0);
+    expect(usage.input + usage.output).toBeGreaterThanOrEqual(0);
+  });
+
+  it('floors a fractional count and zeroes an absurd magnitude in every usage field', async () => {
+    const sse =
+      frame('message_start', {
+        type: 'message_start',
+        message: { usage: { input_tokens: 100.9, cache_creation_input_tokens: '1e308', cache_read_input_tokens: -7 } },
+      }) +
+      frame('message_delta', { type: 'message_delta', delta: {}, usage: { output_tokens: Infinity } }) +
+      frame('message_stop', { type: 'message_stop' });
+
+    const { usage } = await run([Buffer.from(sse, 'utf8')]);
+
+    expect(usage.input).toBe(100);
+    expect(usage.output).toBe(0);
+    expect(usage.cacheWrite).toBe(0);
+    expect(usage.cacheRead).toBe(0);
+  });
+
   it('ignores a malformed data payload without throwing and without stopping the passthrough', async () => {
     const sse =
       MESSAGE_START +
