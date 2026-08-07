@@ -421,31 +421,50 @@ describe('POST /v1/messages (G1 anthropic-compat raw route)', () => {
     }
   });
 
-  it('refuses a streaming request with 503 streaming_not_supported and makes zero upstream requests (P-06)', async () => {
+  // UPDATED BY PLAN 45-07 (G2). This test asserted the P-06 refusal: 503
+  // `streaming_not_supported` with zero upstream requests. That branch no
+  // longer exists — a streaming request is now relayed for real. The one
+  // assertion changed is the outcome; the SSE proofs themselves (byte fidelity,
+  // chunk splits, metering, settle-on-abort) live in
+  // test/plane-llm-raw-stream.test.ts, which needs a streaming upstream this
+  // suite's buffered harness cannot provide.
+  it('no longer refuses a streaming request — it reaches the upstream and is relayed (G2 replaces P-06)', async () => {
     const { db, sql } = getDb(cfg);
     const upstream = await startUpstream({ usage: { input_tokens: 1, output_tokens: 1 } });
+    const app = buildServer({ cfg, db, engine });
     try {
       const { agent, apiKey } = await registerAgent(db, { name: `llmraw-stream-${Date.now()}`, tenant: 'test', allowedModels: [MODEL] });
       await seedBudget(db, agent.id, 1_000_000, 1_000_000);
       await putCredential(db, cfg, agent.id, 'llm:anthropic', 'anthropic-key-xyz', `http://127.0.0.1:${upstream.port}`);
-      const app = buildServer({ cfg, db, engine });
+      const base = await app.listen({ port: 0, host: '127.0.0.1' });
 
-      const res = await app.inject({
-        method: 'POST', url: '/v1/messages',
-        headers: { 'x-api-key': apiKey },
-        payload: { model: MODEL, messages: [], stream: true },
+      const correlationId = randomUUID();
+      const res = await fetch(`${base}/v1/messages`, {
+        method: 'POST',
+        headers: { 'x-api-key': apiKey, 'content-type': 'application/json', 'x-correlation-id': correlationId },
+        body: JSON.stringify({ model: MODEL, messages: [], stream: true }),
       });
+      await res.arrayBuffer();
 
-      expect(res.statusCode).toBe(503);
-      const body = JSON.parse(res.body) as { error?: { type?: string; gateway_code?: string } };
-      expect(body.error?.type).toBe('api_error');
-      expect(body.error?.gateway_code).toBe('streaming_not_supported');
-      // Buffering a stream request is NOT a valid degrade — plan 45-07 (G2)
-      // replaces this branch with the real passthrough.
-      expect(upstream.requests.length).toBe(0);
+      expect(res.status).not.toBe(503);
+      expect(res.status).toBe(200);
+      // The whole point of the change: the call now actually reaches Anthropic.
+      expect(upstream.requests.length).toBe(1);
 
-      await app.close();
+      // A streamed turn settles AFTER the response body has finished, so the
+      // audit write is still in flight when arrayBuffer() resolves. Waiting for
+      // it is not politeness: closing the pool underneath an unfinished settle
+      // is exactly how a "passing" suite hides a lost governance record.
+      let record: { verdict: string } | undefined;
+      for (let i = 0; i < 100 && !record; i++) {
+        [record] = await db.select().from(auditRecords)
+          .where(dsql`${auditRecords.whenWhere}->>'correlationId' = ${correlationId}`).limit(1);
+        if (!record) await new Promise((r) => setTimeout(r, 20));
+      }
+      expect(record).toBeDefined();
+      expect(record?.verdict).toBe('allow');
     } finally {
+      await app.close();
       await sql.end();
       await new Promise((r) => upstream.server.close(r));
     }

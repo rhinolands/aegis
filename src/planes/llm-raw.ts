@@ -1,4 +1,7 @@
 import { randomUUID } from 'node:crypto';
+import { Readable } from 'node:stream';
+import { pipeline } from 'node:stream/promises';
+import type { ReadableStream as WebReadableStream } from 'node:stream/web';
 import type { FastifyInstance, FastifyReply, FastifyRequest } from 'fastify';
 import { eq } from 'drizzle-orm';
 import type { ServerDeps } from '../server.js';
@@ -7,6 +10,7 @@ import { agents } from '../db/schema.js';
 import { getCredentialTarget } from '../credentials/store.js';
 import { governPreflight, governSettle, type GovernContext, type GovernDeps } from '../pipeline/govern.js';
 import { extractUsage, priceMicros } from '../pricing/models.js';
+import { makeUsageTee, type StreamUsage } from '../streaming/sse-usage-tee.js';
 import { log } from '../log.js';
 
 // ---------------------------------------------------------------------------
@@ -59,6 +63,13 @@ const DENIAL_MESSAGE = 'Request denied by the governance gateway.';
 /**
  * The published gateway_code vocabulary (D-09). This is a CONTRACT with Acme:
  * Acme switches on `err.error.error.gateway_code` and renders its own copy.
+ *
+ * The streaming-refusal member is deliberately RETAINED after plan 45-07 (G2)
+ * replaced plan 45-05's P-06 refusal with the real passthrough. No code path
+ * emits it on the normal streaming flow any more, but the published vocabulary
+ * is a contract Acme already switches on, and a future path that has to refuse
+ * a streamed body (an upstream style that cannot stream, a kill switch) should
+ * still have a defined, Acme-safe way to say so rather than inventing one.
  */
 type GatewayCode =
   | 'model_not_allowed'
@@ -246,22 +257,7 @@ export function registerLlmRawPlane(app: FastifyInstance, deps: ServerDeps): voi
     }
     const decision = pre.decision;
 
-    // 4. P-06: streaming is REFUSED, not buffered. Buffering is not a graceful
-    //    degrade — the SDK selects SSE parsing from its own request flag and
-    //    never from the response content-type, so a buffered reply to
-    //    messages.stream() yields zero events and finalMessage() throws
-    //    "request ended without sending any chunks". An explicit 503 makes the
-    //    gap visible. Plan 45-07 (G2) replaces exactly this branch with the
-    //    real SSE passthrough. Settled with a zero-usage error marker rather
-    //    than dropped, so an authorized-but-refused turn is still auditable.
-    if ((body as { stream?: unknown }).stream === true) {
-      await governSettle(govDeps, ctx, decision, { tokens: 0, costMicros: 0, error: 'streaming_not_supported' });
-      return reply
-        .code(503)
-        .send(anthropicError('api_error', 'Streaming is not supported by this gateway yet.', 'streaming_not_supported'));
-    }
-
-    // 5. Credential AND destination in ONE lookup. Never getCredentialSecret
+    // 4. Credential AND destination in ONE lookup. Never getCredentialSecret
     //    -only: pairing that secret with any otherwise-sourced URL recreates
     //    the exfiltration primitive this codebase already fixed once (see the
     //    nine-line warning on the secret-only accessor in
@@ -276,7 +272,7 @@ export function registerLlmRawPlane(app: FastifyInstance, deps: ServerDeps): voi
         .send(anthropicError('permission_error', DENIAL_MESSAGE, 'not_provisioned'));
     }
 
-    // 6. The registered upstream_url is a bare ORIGIN (unlike the envelope
+    // 5. The registered upstream_url is a bare ORIGIN (unlike the envelope
     //    route, which POSTs to it as-is), so the path is concatenated here.
     const base = registered.upstreamUrl.replace(/\/+$/, '');
     const wantsBeta = (req.query as { beta?: unknown } | undefined)?.beta !== undefined;
@@ -314,14 +310,118 @@ export function registerLlmRawPlane(app: FastifyInstance, deps: ServerDeps): voi
         .send(anthropicError('api_error', 'The upstream model provider attempted a redirect, which is refused.', 'upstream_redirect'));
     }
 
-    // Read the bytes, never a parsed object: a non-JSON upstream body (an HTML
-    // error page from an intercepting proxy, an empty 502) must be relayed as
-    // it stands, not silently rewritten into {}.
-    const text = await upstream.text();
     // The upstream request id is the join key Phase 47's audit correlation
     // will want between an Acme-side record and the real Anthropic call.
     const requestId = upstream.headers.get('request-id');
     if (requestId) reply.header('request-id', requestId);
+
+    // ---------------------------------------------------------------------
+    // 6. G2 — SSE PASSTHROUGH.
+    //
+    // WHY BOTH BRANCHES SHARE THE ONE fetch ABOVE, AND WHY THE STATUS IS
+    // CHECKED BEFORE A SINGLE BYTE IS WRITTEN.
+    // Once the first byte of an SSE response is on the wire the HTTP status is
+    // fixed, and the caller's SDK cannot recover from a late failure:
+    // finalMessage() throws `request ended without sending any chunks` if the
+    // stream produced nothing (lib/MessageStream.js:429-431) and
+    // `Unexpected event order, got X before "message_start"` if the first event
+    // is not message_start (:442-443). An SSE `error` event mid-stream is no
+    // escape hatch either — it reaches the SDK as an UNTYPED APIError with
+    // status undefined (core/streaming.js:113-118), so it can carry no typed
+    // denial. A gateway that opens an SSE response and THEN fails therefore
+    // produces an opaque, unclassifiable Acme-side error.
+    //
+    // So the ordering is structural, not stylistic: governPreflight has already
+    // run, the credential is already resolved, the upstream has already
+    // answered, and its status has already been inspected (the 3xx branch
+    // above, and `upstream.ok` here). A non-2xx or body-less upstream on a
+    // streaming request falls through to the SAME Pattern-3 buffered relay the
+    // non-streaming branch uses — real status, real bytes, no half-opened
+    // stream. A mid-stream deny is not merely avoided here; it is made
+    // structurally impossible.
+    // ---------------------------------------------------------------------
+    if ((body as { stream?: unknown }).stream === true && upstream.ok && upstream.body !== null) {
+      const usage: StreamUsage = { input: 0, output: 0, cacheWrite: 0, cacheRead: 0 };
+
+      // SINGLE-SHOT SETTLE. A client abort racing the pipeline's rejection would
+      // otherwise meter the same turn twice. The promise is assigned before the
+      // first `await` inside it, so the guard cannot itself be raced, and later
+      // callers await the SAME in-flight settle rather than starting a second.
+      let settled: Promise<void> | null = null;
+      const settleOnce = (error?: string): Promise<void> => {
+        if (settled) return settled;
+        settled = (async () => {
+          const { costMicros, priced } = priceMicros(model, usage.input, usage.output);
+          if (!priced) {
+            log.error(
+              { model, agentId: principal.agentId },
+              'unpriced_model: allowlisted model has no MODEL_PRICES entry — cost metered as 0',
+            );
+          }
+          // THE ROADMAP G2 RULE, now citation-grounded by the block above:
+          // bytes already delivered means the audit verdict stays `allow` with
+          // whatever usage was accumulated plus an error marker — NEVER a
+          // retroactive 403. Metering is attached to pipeline COMPLETION, not
+          // to sighting message_stop, so a normal end, an upstream fault and a
+          // closed tab all settle (RESEARCH Pitfall 9: closing the tab must not
+          // be a way to get free tokens).
+          const res = await governSettle(govDeps, ctx, decision, {
+            tokens: usage.input + usage.output,
+            costMicros,
+            error,
+          });
+          if (!res.ok) {
+            log.error(
+              { agentId: principal.agentId, correlationId: ctx.correlationId },
+              'llm-raw: streamed turn executed but could not be settled; record only recoverable from this log line',
+            );
+          }
+        })();
+        return settled;
+      };
+
+      // Acme's own advisor route writes this exact header set before relaying
+      // SSE to the browser (apps/api/src/routes/blueprints/advisor.ts), and the
+      // relayed stream travels the same path. The accel-buffering header tells
+      // an intermediary proxy not to hold the stream back, which would destroy
+      // the token-by-token rendering the advisor lane exists for.
+      reply.raw.writeHead(200, {
+        'content-type': upstream.headers.get('content-type') ?? 'text/event-stream',
+        'cache-control': 'no-cache',
+        connection: 'keep-alive',
+        'x-accel-buffering': 'no',
+        ...(requestId ? { 'request-id': requestId } : {}),
+      });
+      reply.hijack();
+
+      // A response that emits `close` before it finished writing IS the client
+      // disconnect. Fire-and-forget is safe because settleOnce is idempotent and
+      // the catch below awaits the same promise.
+      reply.raw.on('close', () => {
+        if (!reply.raw.writableFinished) void settleOnce('client_disconnected');
+      });
+
+      const tee = makeUsageTee((u) => { Object.assign(usage, u); });
+      try {
+        // WHY pipeline AND NOT A BARE PIPE CHAIN: it destroys BOTH ends on
+        // failure and propagates backpressure and errors natively, so a slow
+        // client throttles the upstream read instead of growing a buffer, and a
+        // dead upstream tears the client response down instead of hanging it
+        // open. A bare pipe leaks the loser of either race.
+        await pipeline(Readable.fromWeb(upstream.body as WebReadableStream<Uint8Array>), tee, reply.raw);
+        await settleOnce();
+      } catch (err) {
+        log.error({ err, agentId: principal.agentId }, 'llm-raw: SSE relay ended abnormally');
+        await settleOnce(err instanceof Error ? err.message : String(err));
+        reply.raw.destroy();
+      }
+      return reply;
+    }
+
+    // 7. Buffered relay. Read the bytes, never a parsed object: a non-JSON
+    // upstream body (an HTML error page from an intercepting proxy, an empty
+    // 502) must be relayed as it stands, not silently rewritten into {}.
+    const text = await upstream.text();
 
     if (!upstream.ok) {
       // PATTERN 3 — the whole point of this route. Relay Anthropic's own
