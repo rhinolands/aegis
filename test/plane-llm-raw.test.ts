@@ -53,6 +53,12 @@ interface UpstreamOptions {
    * code path than the one this knob exists to exercise.
    */
   truncateAfterHeaders?: boolean;
+  /**
+   * Answer with NO `content-type` at all. An upstream is not obliged to send
+   * one, and a gateway that decides "is this an event stream?" from that header
+   * has to behave when it is absent (WR-04, Test 3).
+   */
+  omitContentType?: boolean;
 }
 
 /**
@@ -84,7 +90,10 @@ function startUpstream(opts: UpstreamOptions = {}): Promise<{ server: Server; po
           return;
         }
         const payload = opts.body ?? JSON.stringify({ ok: true, ...(opts.usage ? { usage: opts.usage } : {}) });
-        res.writeHead(opts.status ?? 200, { 'content-type': 'application/json', ...(opts.headers ?? {}) });
+        res.writeHead(opts.status ?? 200, {
+          ...(opts.omitContentType ? {} : { 'content-type': 'application/json' }),
+          ...(opts.headers ?? {}),
+        });
         res.end(payload);
       });
     });
@@ -661,7 +670,16 @@ describe('POST /v1/messages (G1 anthropic-compat raw route)', () => {
   // chunk splits, metering, settle-on-abort) live in
   // test/plane-llm-raw-stream.test.ts, which needs a streaming upstream this
   // suite's buffered harness cannot provide.
-  it('no longer refuses a streaming request — it reaches the upstream and is relayed (G2 replaces P-06)', async () => {
+  //
+  // STRENGTHENED IN PLACE BY PLAN 45-13 (WR-04). This is the replacement for the
+  // deleted P-06 refusal test, so its job is to guarantee that a streamed turn
+  // is METERED — and it asserted only status, request count and verdict. Its
+  // upstream is BUFFERED JSON, so before 45-13 the request took the streaming
+  // branch, the tee saw no message_start or message_delta, and the turn settled
+  // `allow` with tokens 0 / costMicros 0 and no error marker: a fully-billed
+  // call metered at zero, with this test watching and saying nothing. The
+  // budget-delta assertion below is the property the replacement exists for.
+  it('no longer refuses a streaming request — it reaches the upstream, is relayed, and is METERED (G2 replaces P-06)', async () => {
     const { db, sql } = getDb(cfg);
     const upstream = await startUpstream({ usage: { input_tokens: 1, output_tokens: 1 } });
     const app = buildServer({ cfg, db, engine });
@@ -672,6 +690,7 @@ describe('POST /v1/messages (G1 anthropic-compat raw route)', () => {
       const base = await app.listen({ port: 0, host: '127.0.0.1' });
 
       const correlationId = randomUUID();
+      const [before] = await db.select().from(budgets).where(eq(budgets.agentId, agent.id)).limit(1);
       const res = await fetch(`${base}/v1/messages`, {
         method: 'POST',
         headers: { 'x-api-key': apiKey, 'content-type': 'application/json', 'x-correlation-id': correlationId },
@@ -696,6 +715,61 @@ describe('POST /v1/messages (G1 anthropic-compat raw route)', () => {
       }
       expect(record).toBeDefined();
       expect(record?.verdict).toBe('allow');
+
+      // WR-04. The upstream returned buffered `application/json`, not an event
+      // stream, so the turn must be metered FROM THAT BODY: 1 input + 1 output.
+      //   1 / 1000 x  3,000 =  3 micros of input
+      //   1 / 1000 x 15,000 = 15 micros of output
+      //                total = 18 micros
+      // Zero here is the WR-04 bug: an `allow` record with no error marker for a
+      // call the upstream fully performed and will bill.
+      const [after] = await db.select().from(budgets).where(eq(budgets.agentId, agent.id)).limit(1);
+      expect(after.tokensUsed - before.tokensUsed).toBe(2);
+      expect(after.tokensUsed - before.tokensUsed).not.toBe(0);
+      expect(after.costUsedMicros - before.costUsedMicros).toBe(18);
+      expect(after.costUsedMicros - before.costUsedMicros).not.toBe(0);
+    } finally {
+      await app.close();
+      await sql.end();
+      await new Promise((r) => upstream.server.close(r));
+    }
+  });
+
+  it('meters a stream: true request whose 2xx response carries NO content-type, rather than settling it at zero', async () => {
+    const { db, sql } = getDb(cfg);
+    // An upstream is not obliged to send a content-type. Absent one, the
+    // response is certainly not a proven event stream, so the streaming branch
+    // must not claim it — the buffered relay meters it correctly instead.
+    const upstream = await startUpstream({ omitContentType: true, usage: { input_tokens: 1000, output_tokens: 500 } });
+    const app = buildServer({ cfg, db, engine });
+    try {
+      const { agent, apiKey } = await registerAgent(db, { name: `llmraw-noct-${Date.now()}`, tenant: 'test', allowedModels: [MODEL] });
+      await seedBudget(db, agent.id, 1_000_000, 1_000_000);
+      await putCredential(db, cfg, agent.id, 'llm:anthropic', 'anthropic-key-xyz', `http://127.0.0.1:${upstream.port}`);
+      const base = await app.listen({ port: 0, host: '127.0.0.1' });
+
+      const correlationId = randomUUID();
+      const [before] = await db.select().from(budgets).where(eq(budgets.agentId, agent.id)).limit(1);
+      const res = await fetch(`${base}/v1/messages`, {
+        method: 'POST',
+        headers: { 'x-api-key': apiKey, 'content-type': 'application/json', 'x-correlation-id': correlationId },
+        body: JSON.stringify({ model: MODEL, messages: [], stream: true }),
+      });
+      await res.arrayBuffer();
+      expect(res.status).toBe(200);
+      // Not a half-opened SSE response — the buffered relay answered.
+      expect(res.headers.get('x-accel-buffering')).toBeNull();
+
+      const rows = await auditFor(db, correlationId);
+      expect(rows.length).toBe(1);
+      expect(rows[0].verdict).toBe('allow');
+
+      // Metered from the body, asserted positively rather than as "not zero"
+      // alone: 1,000/1000 x 3,000 + 500/1000 x 15,000 = 10,500 micros.
+      const [after] = await db.select().from(budgets).where(eq(budgets.agentId, agent.id)).limit(1);
+      expect(after.tokensUsed - before.tokensUsed).toBe(1500);
+      expect(after.costUsedMicros - before.costUsedMicros).toBe(10500);
+      expect(after.costUsedMicros - before.costUsedMicros).not.toBe(0);
     } finally {
       await app.close();
       await sql.end();
