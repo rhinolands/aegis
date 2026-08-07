@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { MODEL_PRICES, extractUsage, priceMicros } from '../src/pricing/models.js';
+import { MODEL_PRICES, extractUsage, priceMicros, type ModelPrice } from '../src/pricing/models.js';
 
 // Split-rate arithmetic proof. The single blended rate this module replaces
 // could not express "output costs 5x input", so a cost cap built on it tripped
@@ -49,25 +49,129 @@ describe('extractUsage — untrusted upstream coercion', () => {
     expect(extractUsage('anthropic', { usage: { input_tokens: '40', output_tokens: 60 } })).toEqual({
       input: 40,
       output: 60,
+      cacheWrite: 0,
+      cacheRead: 0,
     });
   });
 
   it('returns zeros for a body with no usage block and for a null body', () => {
-    expect(extractUsage('anthropic', {})).toEqual({ input: 0, output: 0 });
-    expect(extractUsage('anthropic', null)).toEqual({ input: 0, output: 0 });
+    expect(extractUsage('anthropic', {})).toEqual({ input: 0, output: 0, cacheWrite: 0, cacheRead: 0 });
+    expect(extractUsage('anthropic', null)).toEqual({ input: 0, output: 0, cacheWrite: 0, cacheRead: 0 });
   });
 
   it('reads openai-style prompt/completion token fields', () => {
     expect(extractUsage('openai', { usage: { prompt_tokens: 10, completion_tokens: 20 } })).toEqual({
       input: 10,
       output: 20,
+      cacheWrite: 0,
+      cacheRead: 0,
     });
   });
 
   it('preserves the pre-existing openai total_tokens fallback as input with zero output', () => {
     // The envelope plane metered `total_tokens` before the split; losing it
     // would silently under-meter every openai-style call to zero.
-    expect(extractUsage('openai', { usage: { total_tokens: 30 } })).toEqual({ input: 30, output: 0 });
+    expect(extractUsage('openai', { usage: { total_tokens: 30 } })).toEqual({
+      input: 30,
+      output: 0,
+      cacheWrite: 0,
+      cacheRead: 0,
+    });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// CR-02. Anthropic's usage.input_tokens EXCLUDES both cache classes, so a
+// prompt sent with cache_control reports ~20 input tokens for a 200,000-token
+// prompt the operator is really billed for. The tee already COLLECTED the two
+// cache counters and the pricing module then threw them away, which is the
+// same silently-zero failure mode `priced: false` exists to prevent — but with
+// no signal and no log line.
+//
+// This is reachable today, not hypothetically: planes/llm-raw.ts forwards
+// req.rawLlmBody verbatim and validates only `model`, and the allowlist keys on
+// request.model rather than on body shape. Any authenticated agent can send
+// cache_control.
+//
+// Rates below are re-derivable from the [VERIFIED] block in src/pricing/models.ts:
+//   Sonnet 4.6  input 3000 -> cache write (5m) 1.25x = 3750, cache read 0.10x = 300
+//   Haiku 4.5   input 1000 -> cache write (5m) 1.25x = 1250, cache read 0.10x = 100
+// ---------------------------------------------------------------------------
+describe('priceMicros — all four billed token classes', () => {
+  it('prices a worked four-class example on Sonnet 4.6 at 831,000 micros', () => {
+    // 12,000 in      -> 12000/1000 * 3000  =  36,000
+    //  2,000 out     ->  2000/1000 * 15000 =  30,000
+    // 200,000 write  -> 200000/1000 * 3750 = 750,000
+    //  50,000 read   -> 50000/1000 * 300   =  15,000
+    //                                total = 831,000
+    const { costMicros, priced } = priceMicros('claude-sonnet-4-6', 12_000, 2_000, 200_000, 50_000);
+    expect(costMicros).toBe(831_000);
+    expect(priced).toBe(true);
+    // The regression this exists to catch: dropping the two cache terms, which
+    // is what the code did before and which under-meters this turn by 92%.
+    expect(costMicros).not.toBe(66_000);
+  });
+
+  it('does not price either cache class at the base input rate', () => {
+    // A copy-paste of inputMicrosPer1K into either new field fails here.
+    const base = priceMicros('claude-sonnet-4-6', 100_000, 0).costMicros;
+    const write = priceMicros('claude-sonnet-4-6', 0, 0, 100_000, 0).costMicros;
+    const read = priceMicros('claude-sonnet-4-6', 0, 0, 0, 100_000).costMicros;
+    // Cache WRITE is more expensive than plain input (1.25x); cache READ is far
+    // cheaper (0.10x). Both must differ from base, in opposite directions.
+    expect(write).toBeGreaterThan(base);
+    expect(read).toBeLessThan(base);
+    expect(write).not.toBe(base);
+    expect(read).not.toBe(base);
+  });
+
+  it('is backward compatible — a three-argument call behaves exactly as before', () => {
+    // planes/llm.ts and planes/llm-raw.ts still call the three-arg form; 45-13
+    // rewires them. Until then the cache parameters must default to 0.
+    expect(priceMicros('claude-sonnet-4-6', 12_000, 2_000)).toEqual(
+      priceMicros('claude-sonnet-4-6', 12_000, 2_000, 0, 0),
+    );
+    expect(priceMicros('claude-sonnet-4-6', 12_000, 2_000).costMicros).toBe(66_000);
+  });
+
+  it('reads both cache counters from an anthropic non-streaming body', () => {
+    const u = extractUsage('anthropic', {
+      usage: {
+        input_tokens: 20,
+        output_tokens: 5,
+        cache_creation_input_tokens: 200_000,
+        cache_read_input_tokens: 1_234,
+      },
+    });
+    expect(u.cacheWrite).toBe(200_000);
+    expect(u.cacheRead).toBe(1_234);
+    // Absent fields are 0, not undefined — the sum at the settle site must stay
+    // a number.
+    const bare = extractUsage('anthropic', { usage: { input_tokens: 1 } });
+    expect(bare.cacheWrite).toBe(0);
+    expect(bare.cacheRead).toBe(0);
+  });
+
+  it('prices the CR-02 cached-prompt scenario far above what input_tokens alone reports', () => {
+    // The exact exploit: a 200K-token prompt with cache_control reports ~20
+    // input tokens. Asserted as a LOWER BOUND so this test does not re-pin the
+    // rate — the [VERIFIED] block in the source is the only place a rate lives.
+    const u = extractUsage('anthropic', {
+      usage: { input_tokens: 20, output_tokens: 0, cache_creation_input_tokens: 200_000 },
+    });
+    const cached = priceMicros('claude-sonnet-4-6', u.input, u.output, u.cacheWrite, u.cacheRead).costMicros;
+    const blindToCache = priceMicros('claude-sonnet-4-6', u.input, u.output).costMicros;
+
+    expect(blindToCache).toBeLessThan(100); // ~60 micros: what the meter used to see
+    expect(cached).toBeGreaterThan(500_000); // real spend is ~$0.75 = ~750,000 micros
+    expect(cached / Math.max(blindToCache, 1)).toBeGreaterThan(1_000);
+  });
+
+  it('keeps the priced:false signal across all four classes for an unpriced model', () => {
+    expect(priceMicros('claude-sonnet-5', 1_000, 1_000, 1_000, 1_000)).toEqual({
+      costMicros: 0,
+      priced: false,
+    });
   });
 });
 
@@ -151,7 +255,58 @@ describe('MODEL_PRICES — table shape invariants', () => {
   it('carries the verified per-MTok figures in the units the meter expects (micros per 1K tokens)', () => {
     // Meter-unit sanity check (the x730 discipline): a per-MTok figure dropped
     // in unchanged would under-meter 1000x; a per-token figure over-meter 1000x.
-    expect(MODEL_PRICES['claude-sonnet-4-6']).toEqual({ inputMicrosPer1K: 3_000, outputMicrosPer1K: 15_000 });
-    expect(MODEL_PRICES['claude-haiku-4-5-20251001']).toEqual({ inputMicrosPer1K: 1_000, outputMicrosPer1K: 5_000 });
+    expect(MODEL_PRICES['claude-sonnet-4-6']).toEqual({
+      inputMicrosPer1K: 3_000,
+      outputMicrosPer1K: 15_000,
+      cacheWriteMicrosPer1K: 3_750,
+      cacheReadMicrosPer1K: 300,
+    });
+    expect(MODEL_PRICES['claude-haiku-4-5-20251001']).toEqual({
+      inputMicrosPer1K: 1_000,
+      outputMicrosPer1K: 5_000,
+      cacheWriteMicrosPer1K: 1_250,
+      cacheReadMicrosPer1K: 100,
+    });
+  });
+
+  it('holds the published cache multipliers as a ratio on every row, not just on one', () => {
+    // Anthropic publishes cache pricing as a MULTIPLIER of the base input rate
+    // (5-minute write 1.25x, read 0.1x), so the relationship — not just the
+    // absolute figure — is the thing to pin. A future model row added with a
+    // hand-typed cache rate that does not hold the ratio fails here.
+    for (const [model, price] of Object.entries(MODEL_PRICES)) {
+      expect(price.cacheWriteMicrosPer1K, `${model} cache write`).toBe(price.inputMicrosPer1K * 1.25);
+      expect(price.cacheReadMicrosPer1K, `${model} cache read`).toBe(price.inputMicrosPer1K * 0.1);
+    }
+  });
+
+  it('is frozen at the table AND the row level, so no importer can zero a rate at runtime', () => {
+    // WR-10. `const` binds the reference, not the contents. An importer running
+    // MODEL_PRICES['claude-sonnet-4-6'].outputMicrosPer1K = 0 would silently
+    // zero the cost side of every subsequent meter, and the shape tests above —
+    // which read the object at test time — would never observe it.
+    expect(Object.isFrozen(MODEL_PRICES)).toBe(true);
+    for (const [model, price] of Object.entries(MODEL_PRICES)) {
+      expect(Object.isFrozen(price), `${model} row`).toBe(true);
+    }
+
+    // Test files are ESM and therefore strict mode: a write to a frozen
+    // property throws rather than failing silently.
+    const row = MODEL_PRICES['claude-sonnet-4-6'] as ModelPrice;
+    expect(() => {
+      (row as { outputMicrosPer1K: number }).outputMicrosPer1K = 0;
+    }).toThrow(TypeError);
+    expect(MODEL_PRICES['claude-sonnet-4-6'].outputMicrosPer1K).toBe(15_000);
+
+    // Adding a row at runtime is refused the same way.
+    expect(() => {
+      (MODEL_PRICES as Record<string, ModelPrice>)['claude-opus-4-8'] = {
+        inputMicrosPer1K: 0,
+        outputMicrosPer1K: 0,
+        cacheWriteMicrosPer1K: 0,
+        cacheReadMicrosPer1K: 0,
+      };
+    }).toThrow(TypeError);
+    expect(Object.keys(MODEL_PRICES)).toHaveLength(2);
   });
 });
