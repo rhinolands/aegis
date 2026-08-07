@@ -262,7 +262,29 @@ export function registerLlmRawPlane(app: FastifyInstance, deps: ServerDeps): voi
     //    the exfiltration primitive this codebase already fixed once (see the
     //    nine-line warning on the secret-only accessor in
     //    src/credentials/store.ts).
-    const registered = await getCredentialTarget(db, cfg, principal.agentId, 'llm:anthropic');
+    //
+    //    GUARDED, for the same reason as the fetch rejection below (CR-03a).
+    //    governPreflight has ALREADY allowed and has written NOTHING — a
+    //    preflight allow writes no record; only governSettle does. So a DB blip,
+    //    a pool exhaustion or a credential-decrypt fault (corruption at rest, a
+    //    rotated master key) thrown from here used to escape the handler as a
+    //    Fastify 500 with NO AUDIT ROW AT ALL for a request the gateway
+    //    authorized. Settle first, then log, then respond — the house pattern of
+    //    the two guards further down.
+    let registered: Awaited<ReturnType<typeof getCredentialTarget>>;
+    try {
+      registered = await getCredentialTarget(db, cfg, principal.agentId, 'llm:anthropic');
+    } catch (err) {
+      await governSettle(govDeps, ctx, decision, { tokens: 0, costMicros: 0, error: 'credential_lookup_failed' });
+      log.error({ err, agentId: principal.agentId }, 'llm-raw: credential lookup failed after authorization — no upstream destination could be resolved');
+      reply.header('x-should-retry', 'false');
+      return reply
+        .code(502)
+        .send(anthropicError('api_error', 'The gateway could not resolve an upstream destination.', 'not_provisioned'));
+    }
+    // A successful lookup that returns nothing is a DIFFERENT condition — the
+    // operator never registered a destination — and it already settles
+    // correctly below. Deliberately left as it was.
     if (!registered || !registered.upstreamUrl) {
       // Fail closed: there is nowhere authorized to send this request.
       await governSettle(govDeps, ctx, decision, { tokens: 0, costMicros: 0, error: 'not_provisioned' });
@@ -421,7 +443,27 @@ export function registerLlmRawPlane(app: FastifyInstance, deps: ServerDeps): voi
     // 7. Buffered relay. Read the bytes, never a parsed object: a non-JSON
     // upstream body (an HTML error page from an intercepting proxy, an empty
     // 502) must be relayed as it stands, not silently rewritten into {}.
-    const text = await upstream.text();
+    //
+    // GUARDED (CR-03b). A connection reset mid-body, a Content-Length mismatch
+    // or a decompression error rejects HERE, after the headers arrived. This
+    // differs from the fetch rejection above in one material way: there, the
+    // call never reached anyone; here, THE UPSTREAM HAS ALREADY PRODUCED AND
+    // WILL BILL THE COMPLETION. Unguarded, that combination is the worst one
+    // available — real money spent, unaudited 500 returned, no trace of the call.
+    // Aegis meters ZERO rather than inventing a figure: it has no usage numbers
+    // at all, and an honest zero carrying a marker is recoverable from the audit
+    // trail, whereas a guessed number is a lie in the meter. This is the same
+    // disposition the relayed-failure and non-JSON branches below already take.
+    let text: string;
+    try {
+      text = await upstream.text();
+    } catch (err) {
+      await governSettle(govDeps, ctx, decision, { tokens: 0, costMicros: 0, error: 'upstream_body_read_failed' });
+      log.error({ err, agentId: principal.agentId }, 'llm-raw: upstream response body could not be read after headers arrived — the completion was produced and will be billed');
+      return reply
+        .code(502)
+        .send(anthropicError('api_error', 'The upstream model provider response could not be read.', 'upstream_unreachable'));
+    }
 
     if (!upstream.ok) {
       // PATTERN 3 — the whole point of this route. Relay Anthropic's own
