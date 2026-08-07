@@ -6,6 +6,7 @@ import type { PolicyEngine } from './policy/opa.js';
 import { registerMcpPlane } from './planes/mcp.js';
 import { registerA2aPlane } from './planes/a2a.js';
 import { registerLlmPlane } from './planes/llm.js';
+import { registerLlmRawPlane } from './planes/llm-raw.js';
 
 export interface ServerDeps { cfg: Config; db: DrizzleDb; engine: PolicyEngine }
 
@@ -19,6 +20,7 @@ export function buildServer(deps: ServerDeps): FastifyInstance {
   registerMcpPlane(app, deps);
   registerA2aPlane(app, deps);
   registerLlmPlane(app, deps);
+  registerLlmRawPlane(app, deps);
   return app;
 }
 
