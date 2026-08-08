@@ -10,6 +10,7 @@
 //   AEGIS_UPSTREAM_SECRET=... npx tsx scripts/update-agent.ts \
 //     --agent-name <name> \
 //     [--allow-model <model-id>]... \
+//     [--allow-tool <tool-name>]... \
 //     [--set-credential] [--upstream-url <origin>] \
 //     [--token-limit <n>] [--cost-limit-micros <n>]
 //
@@ -46,9 +47,19 @@
 //   existing row for the pair, inserts exactly one, and then asserts the count
 //   is 1 — refusing to report success on a state it cannot vouch for.
 //
-// WHAT THIS DELIBERATELY DOES NOT TOUCH.
-//   The tools allowlist column. It carries an ["acme-none"] placeholder on the
-//   live lane agents, it belongs to Phase 46, and this CLI has no flag for it.
+// HOW THE TOOLS ALLOWLIST IS MANAGED (--allow-tool).
+//   The column carried an ["acme-none"] placeholder on the live lane agents
+//   until this flag existed; register.ts is INSERT-only and `agents.name` is
+//   globally unique, so an existing lane agent could not be re-registered to
+//   change it. --allow-tool now sets it, and like --allow-model it REPLACES the
+//   whole array from ONE invocation. That contract is the point: a seeding
+//   caller that looped, passing a single --allow-tool per run, would leave only
+//   the last name allowed and deny the rest — so pass every tool the lane needs
+//   as repeated flags on a single command.
+//
+//   There is deliberately NO price-gate twin for tools (see the validation
+//   block below for the full reasoning): Aegis has no Acme tool catalog, and
+//   inventing one here would be a second source of truth.
 
 import { and, eq, sql as dsql } from 'drizzle-orm';
 import { pathToFileURL } from 'node:url';
@@ -70,6 +81,8 @@ export interface UpdateAgentOptions {
   agentName: string;
   /** When present, REPLACES the allowlist with exactly this set. Absent = leave alone. */
   allowModels?: string[];
+  /** When present, REPLACES `allowed_tools` with exactly this set. Absent = leave alone. */
+  allowTools?: string[];
   /** Replace the scoped upstream credential. Requires `secret`. */
   setCredential?: boolean;
   /** Read from AEGIS_UPSTREAM_SECRET by the CLI. Never a flag, never logged. */
@@ -84,6 +97,7 @@ export interface UpdateAgentResult {
   agentId: string;
   name: string;
   allowedModels: string[];
+  allowedTools: string[];
   /** Rows for (agent, llm:anthropic). The invariant is that this is 1 after a replacement. */
   credentialRowCount: number;
   upstreamUrl: string | null;
@@ -92,6 +106,7 @@ export interface UpdateAgentResult {
 
 const USAGE = `usage: update-agent.ts --agent-name <name>
                        [--allow-model <model-id>]...
+                       [--allow-tool <tool-name>]...
                        [--set-credential] [--upstream-url <origin>]
                        [--token-limit <n>] [--cost-limit-micros <n>]
 
@@ -99,11 +114,17 @@ Updates an already-registered agent. --allow-model is repeatable and REPLACES
 the model allowlist with exactly the supplied set; every value must have a
 MODEL_PRICES entry or nothing is written. --set-credential replaces the
 (agent, ${LLM_TARGET}) credential in place and reads the upstream secret from
-the AEGIS_UPSTREAM_SECRET environment variable — never from a flag.`;
+the AEGIS_UPSTREAM_SECRET environment variable — never from a flag.
+
+--allow-tool is repeatable and likewise REPLACES the tools allowlist with
+exactly the supplied set. Pass every tool the lane needs in ONE invocation:
+looping the command with a single --allow-tool each time leaves only the last
+name allowed.`;
 
 interface Args {
   agentName?: string;
   models: string[];
+  tools: string[];
   setCredential: boolean;
   upstreamUrl?: string;
   tokenLimit?: number;
@@ -111,7 +132,7 @@ interface Args {
 }
 
 function parseArgs(argv: string[]): Args {
-  const args: Args = { models: [], setCredential: false };
+  const args: Args = { models: [], tools: [], setCredential: false };
   for (let i = 0; i < argv.length; i++) {
     const flag = argv[i];
     const next = (): string => {
@@ -122,6 +143,7 @@ function parseArgs(argv: string[]): Args {
     switch (flag) {
       case '--agent-name': args.agentName = next(); break;
       case '--allow-model': args.models.push(next().trim()); break;
+      case '--allow-tool': args.tools.push(next().trim()); break;
       case '--set-credential': args.setCredential = true; break;
       case '--upstream-url': args.upstreamUrl = next(); break;
       case '--token-limit': args.tokenLimit = Number(next()); break;
@@ -197,6 +219,21 @@ export async function updateAgent(
   const models = opts.allowModels === undefined ? undefined : dedupe(opts.allowModels);
   if (models !== undefined) assertPriced(models);
 
+  // DECISION: there is no assertPriced twin for tools, and that is a choice, not
+  // an omission. The obvious guard would be membership in the caller's tool
+  // catalog — but Aegis has no Acme catalog, and hardcoding one here would make
+  // this file a second source of truth that drifts silently from the real one.
+  // The membership assertion therefore belongs to the Acme seed script, which
+  // imports the catalog directly (allCandidateToolsFlat()).
+  //
+  // Naming the consequence so the gap is visible to whoever reads this next:
+  // policy/bundle/gateway.rego authorizes with `input.request.tool in
+  // input.agent.allowedTools` — plain set membership, no normalization, no
+  // fuzzy match. A typo'd tool name written here is therefore a PERMANENT
+  // SILENT DENY that is indistinguishable from a policy decision at request
+  // time. Nothing downstream will ever correct it.
+  const tools = opts.allowTools === undefined ? undefined : dedupe(opts.allowTools);
+
   let upstreamOrigin: string | undefined;
   let secret: string | undefined;
   if (opts.setCredential === true) {
@@ -230,14 +267,22 @@ export async function updateAgent(
 
   // ---- writes ----
   let allowedModels = agent.allowedModels;
-  if (models !== undefined) {
-    // Single UPDATE scoped by id, replacing the whole array. The tools allowlist
-    // column is deliberately not in this SET clause (Phase 46 owns it).
+  let allowedTools = agent.allowedTools;
+  if (models !== undefined || tools !== undefined) {
+    // ONE UPDATE scoped by id for both allowlists — one statement, one round
+    // trip, and each supplied array REPLACES its column wholesale. A column
+    // whose flag was not supplied is not in the SET clause at all, so an
+    // invocation that touches only one allowlist leaves the other byte-identical
+    // rather than rewriting it with a value read a moment earlier.
     const [updated] = await db.update(agents)
-      .set({ allowedModels: models })
+      .set({
+        ...(models !== undefined ? { allowedModels: models } : {}),
+        ...(tools !== undefined ? { allowedTools: tools } : {}),
+      })
       .where(eq(agents.id, agent.id))
       .returning();
     allowedModels = updated.allowedModels;
+    allowedTools = updated.allowedTools;
   }
 
   const credWhere = and(
@@ -298,6 +343,7 @@ export async function updateAgent(
     agentId: agent.id,
     name: agent.name,
     allowedModels,
+    allowedTools,
     credentialRowCount,
     upstreamUrl: row?.upstreamUrl ?? null,
     budget,
@@ -345,6 +391,7 @@ async function main(): Promise<void> {
     const result = await updateAgent(db, cfg, {
       agentName: args.agentName!,
       ...(args.models.length > 0 ? { allowModels: args.models } : {}),
+      ...(args.tools.length > 0 ? { allowTools: args.tools } : {}),
       ...(args.setCredential ? { setCredential: true, secret } : {}),
       ...(args.upstreamUrl !== undefined ? { upstreamUrl: args.upstreamUrl } : {}),
       ...(args.tokenLimit !== undefined ? { tokenLimit: args.tokenLimit } : {}),
@@ -357,6 +404,7 @@ async function main(): Promise<void> {
       agentId: result.agentId,
       name: result.name,
       allowedModels: result.allowedModels,
+      allowedTools: result.allowedTools,
       credential: {
         target: LLM_TARGET,
         rowCount: result.credentialRowCount,
