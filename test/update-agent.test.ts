@@ -18,9 +18,21 @@
 //     asserts the agent's allowlist is unchanged afterwards rather than merely
 //     that the call threw.
 //
-//  3. The upstream destination must stay a bare origin: the raw route appends
-//     `/v1/messages` itself, so a path here yields `…/v1/messages/v1/messages`
-//     and a 404 that looks like a gateway bug.
+//  3. The upstream destination for the LLM target must stay a bare origin: the
+//     raw route appends `/v1/messages` itself, so a path here yields
+//     `…/v1/messages/v1/messages` and a 404 that looks like a gateway bug. The
+//     opposite is true for an `mcp:<tool>` target — the MCP plane fetches the
+//     registered URL verbatim (src/planes/mcp.ts), so a base reduced to its
+//     bare origin would land every mediated call on `/`. The two rules are
+//     therefore enforced by two separate validators, and this suite asserts
+//     both: that the LLM rule is unchanged, and that an mcp row reads back with
+//     its path INTACT.
+//
+//  4. `allowed_tools` is set by this CLI and REPLACED wholesale. A seeding
+//     caller that looped one flag per invocation would leave only the last name
+//     allowed, and an accumulate-instead-of-replace bug would widen a lane
+//     silently — so the replacement property is asserted by passing three names
+//     and then one, and reading back exactly one.
 //
 // These tests require a reachable Postgres and deliberately do NOT gate on one:
 // a skipped run would swallow the proof, which is a failure, not a pass.
@@ -49,11 +61,33 @@ const UNPRICED_MODEL = 'claude-sonnet-4-6-20260301';
 
 const ORIGIN = 'https://api.anthropic.com';
 
+// The real shape the Acme seed will pass: an in-cluster http origin carrying the
+// exec path. Both halves matter — `http:` because there is no TLS on a cluster
+// service DNS name, and the path because the MCP plane fetches this URL verbatim.
+const MCP_BASE = 'http://acme-api.acme-system.svc.cluster.local:3001/internal/mcp/tools';
+const TOOL_READ = 'acme.blueprint.read';
+const TOOL_PROPOSE = 'acme.blueprint.propose_edit';
+const TOOL_RULE = 'acme.advisor.lookup_rule';
+
 /** Number of `(agent, llm:anthropic)` credential rows. The whole invariant is that this is 1. */
 async function credentialRowCount(db: DrizzleDb, agentId: string): Promise<number> {
   const rows = await db.select({ id: scopedCredentials.id }).from(scopedCredentials)
     .where(and(eq(scopedCredentials.agentId, agentId), eq(scopedCredentials.target, LLM_TARGET)));
   return rows.length;
+}
+
+/** Same invariant, per `mcp:<tool>` target: exactly 1 row or selection is a coin flip. */
+async function mcpRowCount(db: DrizzleDb, agentId: string, tool: string): Promise<number> {
+  const rows = await db.select({ id: scopedCredentials.id }).from(scopedCredentials)
+    .where(and(eq(scopedCredentials.agentId, agentId), eq(scopedCredentials.target, `mcp:${tool}`)));
+  return rows.length;
+}
+
+/** The full set of credential rows for an agent, as a comparable snapshot for refusal cases. */
+async function credentialSnapshot(db: DrizzleDb, agentId: string): Promise<string[]> {
+  const rows = await db.select().from(scopedCredentials)
+    .where(eq(scopedCredentials.agentId, agentId));
+  return rows.map((r) => `${r.target}|${r.upstreamUrl ?? ''}`).sort();
 }
 
 // `agents.name` is globally unique, so every test registers its own agent with
@@ -80,8 +114,282 @@ describe('update-agent CLI core', () => {
 
       const [row] = await db.select().from(agents).where(eq(agents.id, agent.id)).limit(1);
       expect(row.allowedModels).toEqual([PRICED_SONNET, PRICED_HAIKU]);
-      // Phase 46 owns the tools column; the live ["acme-none"] placeholder must survive.
+      // No tools flag was supplied, so `allowed_tools` is not in the SET clause at
+      // all and the live ["acme-none"] placeholder survives untouched. This CLI
+      // now manages that column (see the symmetric case below); the two columns
+      // must not bleed into each other in either direction.
       expect(row.allowedTools).toEqual(['acme-none']);
+    } finally {
+      await sql.end();
+    }
+  });
+
+  it('sets allowed_tools to exactly the supplied set and leaves the models allowlist untouched', async () => {
+    const { db, sql } = getDb(cfg);
+    try {
+      const name = freshName('tools');
+      const { agent } = await registerAgent(db, {
+        name, tenant: 'test', allowedTools: ['acme-none'], allowedModels: [PRICED_HAIKU],
+      });
+
+      const result = await updateAgent(db, cfg, {
+        agentName: name,
+        allowTools: [TOOL_READ, TOOL_PROPOSE, TOOL_RULE],
+      });
+      expect(result.allowedTools).toEqual([TOOL_READ, TOOL_PROPOSE, TOOL_RULE]);
+
+      const [row] = await db.select().from(agents).where(eq(agents.id, agent.id)).limit(1);
+      expect(row.allowedTools).toEqual([TOOL_READ, TOOL_PROPOSE, TOOL_RULE]);
+      // The mirror of the assertion above: no model flag was supplied, so the
+      // model allowlist is byte-identical.
+      expect(row.allowedModels).toEqual([PRICED_HAIKU]);
+    } finally {
+      await sql.end();
+    }
+  });
+
+  it('replaces the whole tools array rather than appending to it', async () => {
+    const { db, sql } = getDb(cfg);
+    try {
+      const name = freshName('toolreplace');
+      const { agent } = await registerAgent(db, { name, tenant: 'test', allowedTools: ['acme-none'] });
+
+      await updateAgent(db, cfg, { agentName: name, allowTools: [TOOL_READ, TOOL_PROPOSE, TOOL_RULE] });
+      // A caller that looped `--allow-tool` once per tool would land here with
+      // one name and expect three. Whole-array replacement makes that mistake
+      // loud (a lane denied everything but the last tool) rather than silent.
+      const second = await updateAgent(db, cfg, { agentName: name, allowTools: [TOOL_RULE] });
+      expect(second.allowedTools).toEqual([TOOL_RULE]);
+
+      const [row] = await db.select().from(agents).where(eq(agents.id, agent.id)).limit(1);
+      expect(row.allowedTools).toEqual([TOOL_RULE]);
+    } finally {
+      await sql.end();
+    }
+  });
+
+  it('dedupes repeated tool names and drops an empty entry', async () => {
+    const { db, sql } = getDb(cfg);
+    try {
+      const name = freshName('tooldupe');
+      const { agent } = await registerAgent(db, { name, tenant: 'test', allowedTools: ['acme-none'] });
+
+      const result = await updateAgent(db, cfg, {
+        agentName: name,
+        allowTools: [TOOL_READ, TOOL_READ, '', TOOL_PROPOSE],
+      });
+      expect(result.allowedTools).toEqual([TOOL_READ, TOOL_PROPOSE]);
+
+      const [row] = await db.select().from(agents).where(eq(agents.id, agent.id)).limit(1);
+      expect(row.allowedTools).toEqual([TOOL_READ, TOOL_PROPOSE]);
+    } finally {
+      await sql.end();
+    }
+  });
+
+  it('writes an mcp:<tool> credential whose upstream_url keeps its path', async () => {
+    const { db, sql } = getDb(cfg);
+    try {
+      const name = freshName('mcpwrite');
+      const { agent } = await registerAgent(db, { name, tenant: 'test', allowedTools: ['acme-none'] });
+
+      const result = await updateAgent(db, cfg, {
+        agentName: name,
+        mcpTools: [TOOL_READ, TOOL_PROPOSE],
+        mcpUpstreamBase: MCP_BASE,
+        secret: 'acme-pat-value',
+      });
+
+      expect(result.mcpCredentials.map((c) => c.target))
+        .toEqual([`mcp:${TOOL_READ}`, `mcp:${TOOL_PROPOSE}`]);
+      for (const written of result.mcpCredentials) expect(written.rowCount).toBe(1);
+
+      // Assert on the value READ BACK from the row, not on the argument passed
+      // in: a validator that returned the bare origin would still make the
+      // argument-side assertion pass while every mediated call landed on `/`.
+      const read = await getCredentialTarget(db, cfg, agent.id, `mcp:${TOOL_READ}`);
+      expect(read?.upstreamUrl).toBe(`${MCP_BASE}/${TOOL_READ}`);
+      expect(read?.upstreamUrl).toContain('/internal/mcp/tools/');
+      const readProposeRow = await getCredentialTarget(db, cfg, agent.id, `mcp:${TOOL_PROPOSE}`);
+      expect(readProposeRow?.upstreamUrl).toBe(`${MCP_BASE}/${TOOL_PROPOSE}`);
+
+      expect(await mcpRowCount(db, agent.id, TOOL_READ)).toBe(1);
+      expect(await mcpRowCount(db, agent.id, TOOL_PROPOSE)).toBe(1);
+      // One invocation, N tools, one secret — and the LLM target is untouched by it.
+      expect(await credentialRowCount(db, agent.id)).toBe(0);
+    } finally {
+      await sql.end();
+    }
+  });
+
+  it('resolves a replaced mcp:<tool> credential deterministically across three reads', async () => {
+    const { db, sql } = getDb(cfg);
+    try {
+      const name = freshName('mcpdet');
+      const { agent } = await registerAgent(db, { name, tenant: 'test', allowedTools: ['acme-none'] });
+
+      await updateAgent(db, cfg, {
+        agentName: name, mcpTools: [TOOL_READ], mcpUpstreamBase: MCP_BASE, secret: 'pat-first',
+      });
+      const second = await updateAgent(db, cfg, {
+        agentName: name, mcpTools: [TOOL_READ], mcpUpstreamBase: MCP_BASE, secret: 'pat-second',
+      });
+      expect(second.mcpCredentials[0].rowCount).toBe(1);
+      expect(await mcpRowCount(db, agent.id, TOOL_READ)).toBe(1);
+
+      // Three reads, not one: `.limit(1)` with no ORDER BY makes a single
+      // matching read indistinguishable from a lucky one.
+      const readA = await getCredentialTarget(db, cfg, agent.id, `mcp:${TOOL_READ}`);
+      const readB = await getCredentialTarget(db, cfg, agent.id, `mcp:${TOOL_READ}`);
+      const readC = await getCredentialTarget(db, cfg, agent.id, `mcp:${TOOL_READ}`);
+      expect(readA?.secret).toBe('pat-second');
+      expect(readB?.secret).toBe('pat-second');
+      expect(readC?.secret).toBe('pat-second');
+    } finally {
+      await sql.end();
+    }
+  });
+
+  it('collapses a pre-existing duplicate mcp:<tool> row back to exactly one', async () => {
+    const { db, sql } = getDb(cfg);
+    try {
+      const name = freshName('mcpcollapse');
+      const { agent } = await registerAgent(db, { name, tenant: 'test', allowedTools: ['acme-none'] });
+
+      // The real helper twice, not a synthetic fixture: this is exactly how a
+      // re-run of a seed script would produce the hazard.
+      await putCredential(db, cfg, agent.id, `mcp:${TOOL_READ}`, 'placeholder-one', `${MCP_BASE}/${TOOL_READ}`);
+      await putCredential(db, cfg, agent.id, `mcp:${TOOL_READ}`, 'placeholder-two', `${MCP_BASE}/${TOOL_READ}`);
+      expect(await mcpRowCount(db, agent.id, TOOL_READ)).toBe(2);
+
+      const result = await updateAgent(db, cfg, {
+        agentName: name, mcpTools: [TOOL_READ], mcpUpstreamBase: MCP_BASE, secret: 'pat-real',
+      });
+
+      expect(result.mcpCredentials[0].rowCount).toBe(1);
+      expect(await mcpRowCount(db, agent.id, TOOL_READ)).toBe(1);
+      const read = await getCredentialTarget(db, cfg, agent.id, `mcp:${TOOL_READ}`);
+      expect(read?.secret).toBe('pat-real');
+    } finally {
+      await sql.end();
+    }
+  });
+
+  it('keeps the https-and-origin-only rule on the llm target while allowing a path for mcp targets', async () => {
+    const { db, sql } = getDb(cfg);
+    try {
+      const name = freshName('scoped');
+      const { agent } = await registerAgent(db, { name, tenant: 'test', allowedTools: ['acme-none'] });
+
+      // The relaxation is scoped to mcp:* — the LLM route still appends
+      // `/v1/messages` itself and still must not carry the credential in clear.
+      await expect(updateAgent(db, cfg, {
+        agentName: name, setCredential: true, secret: 'k',
+        upstreamUrl: 'https://api.anthropic.com/v1/messages',
+      })).rejects.toThrow(/origin/i);
+      await expect(updateAgent(db, cfg, {
+        agentName: name, setCredential: true, secret: 'k', upstreamUrl: 'http://api.anthropic.com',
+      })).rejects.toThrow(/https/i);
+      expect(await credentialRowCount(db, agent.id)).toBe(0);
+
+      // The same shape of URL is ACCEPTED for an mcp target.
+      const ok = await updateAgent(db, cfg, {
+        agentName: name, mcpTools: [TOOL_READ], mcpUpstreamBase: MCP_BASE, secret: 'k',
+      });
+      expect(ok.mcpCredentials[0].upstreamUrl).toBe(`${MCP_BASE}/${TOOL_READ}`);
+
+      // A query or fragment is still refused for an mcp base.
+      await expect(updateAgent(db, cfg, {
+        agentName: name, mcpTools: [TOOL_PROPOSE], mcpUpstreamBase: `${MCP_BASE}?x=1`, secret: 'k',
+      })).rejects.toThrow(/query|fragment/i);
+      expect(await mcpRowCount(db, agent.id, TOOL_PROPOSE)).toBe(0);
+    } finally {
+      await sql.end();
+    }
+  });
+
+  it('refuses an mcp tool name that is empty after trim, leaving tools and credentials byte-identical', async () => {
+    const { db, sql } = getDb(cfg);
+    try {
+      const name = freshName('mcpblank');
+      const { agent } = await registerAgent(db, { name, tenant: 'test', allowedTools: ['acme-none'] });
+      await updateAgent(db, cfg, {
+        agentName: name, mcpTools: [TOOL_READ], mcpUpstreamBase: MCP_BASE, secret: 'pat-real',
+      });
+      const beforeCreds = await credentialSnapshot(db, agent.id);
+
+      await expect(updateAgent(db, cfg, {
+        agentName: name,
+        allowTools: [TOOL_READ, TOOL_PROPOSE],
+        mcpTools: [TOOL_PROPOSE, '   '],
+        mcpUpstreamBase: MCP_BASE,
+        secret: 'pat-real',
+      })).rejects.toThrow(/--mcp-tool/);
+
+      // The refusal PRECEDES the first write: the tools column still holds the
+      // placeholder it was registered with, not the half-applied allowTools set.
+      const [row] = await db.select().from(agents).where(eq(agents.id, agent.id)).limit(1);
+      expect(row.allowedTools).toEqual(['acme-none']);
+      expect(await credentialSnapshot(db, agent.id)).toEqual(beforeCreds);
+      expect(await mcpRowCount(db, agent.id, TOOL_PROPOSE)).toBe(0);
+    } finally {
+      await sql.end();
+    }
+  });
+
+  it('refuses an mcp credential write when no secret is supplied — it is never a flag', async () => {
+    const { db, sql } = getDb(cfg);
+    try {
+      const name = freshName('mcpnosecret');
+      const { agent } = await registerAgent(db, { name, tenant: 'test', allowedTools: ['acme-none'] });
+
+      await expect(updateAgent(db, cfg, {
+        agentName: name, mcpTools: [TOOL_READ], mcpUpstreamBase: MCP_BASE,
+      })).rejects.toThrow(/AEGIS_UPSTREAM_SECRET/);
+      await expect(updateAgent(db, cfg, {
+        agentName: name, mcpTools: [TOOL_READ], mcpUpstreamBase: MCP_BASE, secret: '   ',
+      })).rejects.toThrow(/AEGIS_UPSTREAM_SECRET/);
+
+      expect(await mcpRowCount(db, agent.id, TOOL_READ)).toBe(0);
+    } finally {
+      await sql.end();
+    }
+  });
+
+  it('refuses mcp tools without a base and a base without mcp tools, before the first write', async () => {
+    const { db, sql } = getDb(cfg);
+    try {
+      const name = freshName('mcppair');
+      const { agent } = await registerAgent(db, { name, tenant: 'test', allowedTools: ['acme-none'] });
+
+      await expect(updateAgent(db, cfg, {
+        agentName: name, allowTools: [TOOL_READ], mcpTools: [TOOL_READ], secret: 'k',
+      })).rejects.toThrow(/--mcp-upstream-base/);
+      await expect(updateAgent(db, cfg, {
+        agentName: name, allowTools: [TOOL_READ], mcpUpstreamBase: MCP_BASE, secret: 'k',
+      })).rejects.toThrow(/--mcp-tool/);
+
+      const [row] = await db.select().from(agents).where(eq(agents.id, agent.id)).limit(1);
+      expect(row.allowedTools).toEqual(['acme-none']);
+      expect(await credentialSnapshot(db, agent.id)).toEqual([]);
+    } finally {
+      await sql.end();
+    }
+  });
+
+  it('refuses an unknown agent name carrying tools and mcp targets without writing anything', async () => {
+    const { db, sql } = getDb(cfg);
+    try {
+      const before = await db.select({ id: scopedCredentials.id }).from(scopedCredentials);
+      await expect(updateAgent(db, cfg, {
+        agentName: freshName('mcp-does-not-exist'),
+        allowTools: [TOOL_READ],
+        mcpTools: [TOOL_READ],
+        mcpUpstreamBase: MCP_BASE,
+        secret: 'k',
+      })).rejects.toThrow(/acme-\{lane\}/);
+      const after = await db.select({ id: scopedCredentials.id }).from(scopedCredentials);
+      expect(after.length).toBe(before.length);
     } finally {
       await sql.end();
     }
