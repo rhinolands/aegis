@@ -12,6 +12,7 @@
 //     [--allow-model <model-id>]... \
 //     [--allow-tool <tool-name>]... \
 //     [--set-credential] [--upstream-url <origin>] \
+//     [--mcp-tool <tool-name>]... [--mcp-upstream-base <url>] [--secret-stdin] \
 //     [--token-limit <n>] [--cost-limit-micros <n>]
 //
 // Also available as `npm run update-agent -- --agent-name …`.
@@ -23,10 +24,21 @@
 //   box for the lifetime of the run, and the value handled here is the FIRST
 //   real upstream vendor key to enter the Aegis database — every surface it can
 //   leak through is new. It is read from the AEGIS_UPSTREAM_SECRET environment
-//   variable only. It is never logged, never echoed, and never appears in the
-//   completion JSON — not the value, and not a prefix, suffix, length or hash
-//   of it, since all four are useful to an attacker and none are useful to an
-//   operator who already has the key.
+//   variable only, or — with --secret-stdin — from a single read of fd 0. It is
+//   never logged, never echoed, and never appears in the completion JSON — not
+//   the value, and not a prefix, suffix, length or hash of it, since all four
+//   are useful to an attacker and none are useful to an operator who already
+//   has the key.
+//
+//   WHY --secret-stdin EXISTS ALONGSIDE THE ENVIRONMENT VARIABLE.
+//   It is a custody improvement, not a convenience: it lets a caller PIPE a
+//   freshly minted credential straight into this process without the value ever
+//   existing as a shell variable, a `$( … )` capture, a file, or an entry in the
+//   environment of a process an operator might later dump. That is the same
+//   discipline scripts/seed-aegis-identities.sh already uses for the register
+//   CLI's stdout. The read happens ONCE and the value covers every row the
+//   invocation writes. A flag is still refused by construction: no case in
+//   parseArgs accepts a secret value.
 //
 // WHY THE PRICE GATE LIVES HERE.
 //   Every `--allow-model` value is checked against MODEL_PRICES before anything
@@ -45,7 +57,20 @@
 //   credential the gateway actually uses: it could pick the garbage placeholder
 //   the seed script wrote instead of the real key. So this deletes every
 //   existing row for the pair, inserts exactly one, and then asserts the count
-//   is 1 — refusing to report success on a state it cannot vouch for.
+//   is 1 — refusing to report success on a state it cannot vouch for. The same
+//   sequence runs once PER TARGET, so writing N `mcp:<tool>` rows in a single
+//   invocation gets N independent count==1 post-conditions.
+//
+// TWO CREDENTIAL TARGETS, TWO URL RULES — DELIBERATELY NOT SHARED.
+//   `${LLM_TARGET}` points at a vendor API over the public internet: https only,
+//   and a bare origin, because the raw route appends the request path itself.
+//   An `mcp:<tool>` target points at an in-cluster service that mediates one
+//   tool: http is permitted (there is no TLS on a cluster service DNS name) and
+//   a PATH is not merely permitted but required — src/planes/mcp.ts fetches the
+//   registered URL verbatim, so a base reduced to its bare origin would land
+//   every mediated call on `/` and hit whatever handler happens to be there,
+//   carrying an injected credential. The two rules therefore live in two
+//   separate validators and neither is relaxed to accommodate the other.
 //
 // HOW THE TOOLS ALLOWLIST IS MANAGED (--allow-tool).
 //   The column carried an ["acme-none"] placeholder on the live lane agents
@@ -62,6 +87,7 @@
 //   inventing one here would be a second source of truth.
 
 import { and, eq, sql as dsql } from 'drizzle-orm';
+import { readFileSync } from 'node:fs';
 import { pathToFileURL } from 'node:url';
 import { loadConfig, type Config } from '../src/config.js';
 import { getDb, type DrizzleDb } from '../src/db/client.js';
@@ -85,10 +111,14 @@ export interface UpdateAgentOptions {
   allowTools?: string[];
   /** Replace the scoped upstream credential. Requires `secret`. */
   setCredential?: boolean;
-  /** Read from AEGIS_UPSTREAM_SECRET by the CLI. Never a flag, never logged. */
+  /** Read from AEGIS_UPSTREAM_SECRET or fd 0 by the CLI. Never a flag, never logged. */
   secret?: string;
   /** Origin only — no path. Defaults to the Anthropic API origin. */
   upstreamUrl?: string;
+  /** Tool names to register `mcp:<tool>` credential rows for. Requires `mcpUpstreamBase`. */
+  mcpTools?: string[];
+  /** Base URL for the mcp rows; each row's destination is `<base>/<tool>`, path preserved. */
+  mcpUpstreamBase?: string;
   tokenLimit?: number;
   costLimitMicros?: number;
 }
@@ -101,6 +131,8 @@ export interface UpdateAgentResult {
   /** Rows for (agent, llm:anthropic). The invariant is that this is 1 after a replacement. */
   credentialRowCount: number;
   upstreamUrl: string | null;
+  /** One entry per `mcp:<tool>` row written by THIS invocation. Empty when none were. */
+  mcpCredentials: Array<{ target: string; upstreamUrl: string; rowCount: number }>;
   budget: { tokenLimit: number; costLimitMicros: number } | null;
 }
 
@@ -108,6 +140,8 @@ const USAGE = `usage: update-agent.ts --agent-name <name>
                        [--allow-model <model-id>]...
                        [--allow-tool <tool-name>]...
                        [--set-credential] [--upstream-url <origin>]
+                       [--mcp-tool <tool-name>]... [--mcp-upstream-base <url>]
+                       [--secret-stdin]
                        [--token-limit <n>] [--cost-limit-micros <n>]
 
 Updates an already-registered agent. --allow-model is repeatable and REPLACES
@@ -119,20 +153,36 @@ the AEGIS_UPSTREAM_SECRET environment variable — never from a flag.
 --allow-tool is repeatable and likewise REPLACES the tools allowlist with
 exactly the supplied set. Pass every tool the lane needs in ONE invocation:
 looping the command with a single --allow-tool each time leaves only the last
-name allowed.`;
+name allowed.
+
+--mcp-tool is repeatable and registers one scoped credential per tool, at
+target mcp:<tool>, whose destination is <--mcp-upstream-base>/<tool> with the
+path preserved. The two flags are required together. The mcp base may use http
+(in-cluster) and may carry a path; it may not carry a query or fragment. The
+https-and-bare-origin rule for ${LLM_TARGET} is unchanged.
+
+--secret-stdin reads the upstream secret from fd 0 exactly once and uses it for
+every row written, so a caller can pipe a freshly minted credential in without
+it ever becoming a shell variable. Without it the secret comes from
+AEGIS_UPSTREAM_SECRET. It is never accepted as a flag.`;
 
 interface Args {
   agentName?: string;
   models: string[];
   tools: string[];
   setCredential: boolean;
+  mcpTools: string[];
+  mcpUpstreamBase?: string;
+  secretStdin: boolean;
   upstreamUrl?: string;
   tokenLimit?: number;
   costLimitMicros?: number;
 }
 
 function parseArgs(argv: string[]): Args {
-  const args: Args = { models: [], tools: [], setCredential: false };
+  const args: Args = {
+    models: [], tools: [], setCredential: false, mcpTools: [], secretStdin: false,
+  };
   for (let i = 0; i < argv.length; i++) {
     const flag = argv[i];
     const next = (): string => {
@@ -146,6 +196,10 @@ function parseArgs(argv: string[]): Args {
       case '--allow-tool': args.tools.push(next().trim()); break;
       case '--set-credential': args.setCredential = true; break;
       case '--upstream-url': args.upstreamUrl = next(); break;
+      case '--mcp-tool': args.mcpTools.push(next().trim()); break;
+      case '--mcp-upstream-base': args.mcpUpstreamBase = next(); break;
+      // Takes NO value: the secret arrives on fd 0, never in argv.
+      case '--secret-stdin': args.secretStdin = true; break;
       case '--token-limit': args.tokenLimit = Number(next()); break;
       case '--cost-limit-micros': args.costLimitMicros = Number(next()); break;
       case '--help':
@@ -203,6 +257,43 @@ function assertOriginOnly(raw: string): string {
   return url.origin;
 }
 
+/**
+ * The mcp sibling of assertOriginOnly, and deliberately a SEPARATE function
+ * rather than a relaxed shared one: relaxing the vendor rule to accommodate an
+ * in-cluster destination would quietly permit an unencrypted, path-bearing
+ * upstream for the LLM route too.
+ *
+ * Permits http (a cluster service DNS name has no TLS) and permits a path,
+ * which the mediated route depends on. Still refuses a query or fragment: the
+ * tool name is appended to the path, and anything after it would be orphaned.
+ *
+ * RETURNS THE FULL HREF, NOT THE BARE ORIGIN. Reducing this to a scheme+host
+ * would silently discard `/internal/mcp/tools`, and every mediated call would
+ * land on `/` carrying an injected credential. The trailing slash is trimmed so
+ * appending `'/' + tool` cannot produce a doubled separator.
+ */
+function assertMcpBase(raw: string): string {
+  let url: URL;
+  try {
+    url = new URL(raw);
+  } catch {
+    throw new Error(`--mcp-upstream-base is not a valid URL: ${raw}. Nothing was written.`);
+  }
+  if (url.protocol !== 'http:' && url.protocol !== 'https:') {
+    throw new Error(
+      `--mcp-upstream-base must use http or https (got ${url.protocol.replace(':', '')}): ${raw}. ` +
+      `Nothing was written.`,
+    );
+  }
+  if (url.search !== '' || url.hash !== '') {
+    throw new Error(
+      `--mcp-upstream-base must carry no query or fragment (got ${raw}); each row's destination ` +
+      `is formed by appending the tool name to its path. Nothing was written.`,
+    );
+  }
+  return url.href.replace(/\/+$/, '');
+}
+
 function dedupe(values: string[]): string[] {
   return [...new Set(values.filter((v) => v.length > 0))];
 }
@@ -234,18 +325,60 @@ export async function updateAgent(
   // time. Nothing downstream will ever correct it.
   const tools = opts.allowTools === undefined ? undefined : dedupe(opts.allowTools);
 
+  const wantsMcp = opts.mcpTools !== undefined && opts.mcpTools.length > 0;
+  const hasMcpBase =
+    opts.mcpUpstreamBase !== undefined && opts.mcpUpstreamBase.trim().length > 0;
+
   let upstreamOrigin: string | undefined;
   let secret: string | undefined;
-  if (opts.setCredential === true) {
+  if (opts.setCredential === true || wantsMcp) {
     secret = opts.secret;
     if (secret === undefined || secret.trim().length === 0) {
       throw new Error(
         'AEGIS_UPSTREAM_SECRET is unset or blank — it holds the upstream key and is never ' +
         'accepted as a command-line flag. Export it for this one command only, e.g. ' +
-        'AEGIS_UPSTREAM_SECRET="$(cat /path/to/key)" npm run update-agent -- …',
+        'AEGIS_UPSTREAM_SECRET="$(cat /path/to/key)" npm run update-agent -- …, or pipe it ' +
+        'in with --secret-stdin.',
       );
     }
+  }
+  if (opts.setCredential === true) {
     upstreamOrigin = assertOriginOnly(opts.upstreamUrl ?? DEFAULT_UPSTREAM_ORIGIN);
+  }
+
+  // The two mcp flags are meaningless apart: a tool with nowhere to send it, or
+  // a destination nothing is registered against. Refuse rather than guess.
+  if (wantsMcp && !hasMcpBase) {
+    throw new Error(
+      '--mcp-upstream-base is required whenever --mcp-tool is supplied: an mcp:<tool> row ' +
+      'with no destination makes the MCP plane fail closed at request time. Nothing was written.',
+    );
+  }
+  if (hasMcpBase && !wantsMcp) {
+    throw new Error(
+      '--mcp-upstream-base was supplied with no --mcp-tool, so there is no target to register ' +
+      'it against. Nothing was written.',
+    );
+  }
+
+  // Each (target, upstreamUrl) pair this invocation will write, resolved in full
+  // BEFORE the first write so a bad name cannot leave half the set registered.
+  const mcpPairs: Array<{ target: string; upstreamUrl: string }> = [];
+  if (wantsMcp) {
+    const trimmed = (opts.mcpTools as string[]).map((t) => t.trim());
+    if (trimmed.some((t) => t.length === 0)) {
+      // Unlike --allow-tool, an empty entry is NOT silently dropped here: it
+      // would name the target `mcp:` and point it at a URL ending in `/`, which
+      // is a registered credential at a destination nothing can reach.
+      throw new Error(
+        '--mcp-tool value is empty after trimming; every mcp target needs a tool name. ' +
+        'Nothing was written.',
+      );
+    }
+    const base = assertMcpBase(opts.mcpUpstreamBase as string);
+    for (const tool of new Set(trimmed)) {
+      mcpPairs.push({ target: `mcp:${tool}`, upstreamUrl: `${base}/${tool}` });
+    }
   }
 
   const wantsBudget = opts.tokenLimit !== undefined || opts.costLimitMicros !== undefined;
@@ -313,6 +446,32 @@ export async function updateAgent(
     );
   }
 
+  // The same DELETE-then-INSERT-then-assert-count-1 sequence as the LLM target
+  // above, run once per mcp pair. Copied in shape on purpose: it is the only
+  // thing standing between the MCP plane and a coin-flip over which credential
+  // (and therefore which destination) a mediated call resolves.
+  const mcpCredentials: Array<{ target: string; upstreamUrl: string; rowCount: number }> = [];
+  for (const pair of mcpPairs) {
+    const where = and(
+      eq(scopedCredentials.agentId, agent.id),
+      eq(scopedCredentials.target, pair.target),
+    );
+    await db.delete(scopedCredentials).where(where);
+    await putCredential(db, cfg, agent.id, pair.target, secret as string, pair.upstreamUrl);
+    const [{ n: mcpN }] = await db
+      .select({ n: dsql<number>`count(*)::int` })
+      .from(scopedCredentials)
+      .where(where);
+    const rowCount = Number(mcpN);
+    if (rowCount !== 1) {
+      throw new Error(
+        `credential replacement left ${rowCount} rows for (${agent.id}, ${pair.target}); ` +
+        `exactly 1 is required or credential selection is non-deterministic`,
+      );
+    }
+    mcpCredentials.push({ target: pair.target, upstreamUrl: pair.upstreamUrl, rowCount });
+  }
+
   const [existingBudget] = await db.select().from(budgets)
     .where(eq(budgets.agentId, agent.id)).limit(1);
 
@@ -346,8 +505,23 @@ export async function updateAgent(
     allowedTools,
     credentialRowCount,
     upstreamUrl: row?.upstreamUrl ?? null,
+    mcpCredentials,
     budget,
   };
+}
+
+/**
+ * One synchronous read of fd 0, trimmed. Synchronous and single-shot on purpose:
+ * the value must be consumed once and held in exactly one place for the life of
+ * the process. Nothing here logs it, and the caller is expected to have PIPED it
+ * so it never became a shell variable or a file on the way in.
+ */
+function readSecretFromStdin(): string {
+  try {
+    return readFileSync(0, 'utf8').trim();
+  } catch (err) {
+    throw new Error(`--secret-stdin could not read fd 0: ${(err as Error).message}`);
+  }
 }
 
 async function main(): Promise<void> {
@@ -372,14 +546,16 @@ async function main(): Promise<void> {
     process.exit(1);
   }
 
-  // Read the secret from the environment, and fail before the database is even
-  // opened if it is not there. Nothing downstream ever prints this value.
-  const secret = process.env.AEGIS_UPSTREAM_SECRET;
-  if (args.setCredential && (secret === undefined || secret.trim().length === 0)) {
+  // Read the secret from fd 0 or the environment, and fail before the database
+  // is even opened if it is not there. Nothing downstream ever prints this
+  // value. The stdin read happens exactly ONCE and covers every row written.
+  const secret = args.secretStdin ? readSecretFromStdin() : process.env.AEGIS_UPSTREAM_SECRET;
+  const needsSecret = args.setCredential || args.mcpTools.length > 0;
+  if (needsSecret && (secret === undefined || secret.trim().length === 0)) {
     console.error(
-      '--set-credential requires the AEGIS_UPSTREAM_SECRET environment variable to be set to ' +
-      'the upstream key. It is deliberately not accepted as a flag: flag values land in shell ' +
-      'history and in `ps` output.',
+      'a credential write requires the upstream key, supplied either on fd 0 with ' +
+      '--secret-stdin or in the AEGIS_UPSTREAM_SECRET environment variable. It is deliberately ' +
+      'not accepted as a flag: flag values land in shell history and in `ps` output.',
     );
     console.error(USAGE);
     process.exit(1);
@@ -392,7 +568,10 @@ async function main(): Promise<void> {
       agentName: args.agentName!,
       ...(args.models.length > 0 ? { allowModels: args.models } : {}),
       ...(args.tools.length > 0 ? { allowTools: args.tools } : {}),
-      ...(args.setCredential ? { setCredential: true, secret } : {}),
+      ...(args.setCredential ? { setCredential: true } : {}),
+      ...(needsSecret ? { secret } : {}),
+      ...(args.mcpTools.length > 0 ? { mcpTools: args.mcpTools } : {}),
+      ...(args.mcpUpstreamBase !== undefined ? { mcpUpstreamBase: args.mcpUpstreamBase } : {}),
       ...(args.upstreamUrl !== undefined ? { upstreamUrl: args.upstreamUrl } : {}),
       ...(args.tokenLimit !== undefined ? { tokenLimit: args.tokenLimit } : {}),
       ...(args.costLimitMicros !== undefined ? { costLimitMicros: args.costLimitMicros } : {}),
@@ -411,6 +590,8 @@ async function main(): Promise<void> {
         upstreamUrl: result.upstreamUrl,
         replaced: args.setCredential,
       },
+      // Names and counts only, same contract as the LLM entry above.
+      mcpCredentials: result.mcpCredentials,
       budget: result.budget,
     }, null, 2));
   } finally {
