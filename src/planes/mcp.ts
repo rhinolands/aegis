@@ -45,6 +45,12 @@ export function registerMcpPlane(app: FastifyInstance, deps: ServerDeps): void {
     const [agent] = await db.select().from(agents).where(eq(agents.id, principal.agentId)).limit(1);
     if (!agent) return reply.code(403).send({ error: 'unknown agent' });
 
+    // Normalized ONCE, here, and read from this const everywhere below —
+    // including the upstream forward in execute(). A second read of
+    // req.headers would reintroduce the raw caller string and could let the
+    // audited record and the relayed header disagree.
+    const correlationId = (req.headers['x-correlation-id'] as string) ?? randomUUID();
+
     const result = await govern(
       { db, cfg, engine },
       {
@@ -53,7 +59,7 @@ export function registerMcpPlane(app: FastifyInstance, deps: ServerDeps): void {
         plane: 'mcp',
         request: { tool, operation },
         target: `mcp:${tool}`,
-        correlationId: (req.headers['x-correlation-id'] as string) ?? randomUUID(),
+        correlationId,
         origin: req.ip,
         args,
       },
@@ -74,6 +80,16 @@ export function registerMcpPlane(app: FastifyInstance, deps: ServerDeps): void {
         }
         const headers: Record<string, string> = { 'content-type': 'application/json' };
         headers['authorization'] = `Bearer ${registered.secret}`;
+        // G6 (Acme Phase 47 / AGW-08): relay the caller's correlation id to the
+        // operator-registered upstream so the backend's own audit row can be
+        // joined to this gateway record. Server-authored from the SAME
+        // normalized `correlationId` the govern context is built from, never
+        // re-read from the request — so the relayed header and the audited
+        // record can never disagree. This is an opaque correlation token only:
+        // it selects no destination, carries no authority, and gates nothing.
+        // The destination and the credential still come solely from the
+        // operator-registered row.
+        headers['x-correlation-id'] = correlationId;
         // redirect: 'manual' + explicit 3xx rejection below: a mediated call
         // must terminate at the operator-registered destination and must
         // never be silently redirected elsewhere. Node 22's undici happens to
