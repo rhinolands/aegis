@@ -1,5 +1,6 @@
 import { describe, it, expect, beforeAll, afterAll } from 'vitest';
 import { createServer, type Server, type IncomingMessage } from 'node:http';
+import { randomUUID } from 'node:crypto';
 import { getDb } from '../src/db/client.js';
 import { loadConfig } from '../src/config.js';
 import { loadPolicy, type PolicyEngine } from '../src/policy/opa.js';
@@ -72,6 +73,74 @@ describe('POST /mcp/:tool', () => {
       // presented its own api key and never possessed this value.
       expect(received.headers['authorization']).toBe('Bearer backend-token-xyz');
       expect(received.body).toEqual({ operation: 'call', args: { msg: 'hi' } });
+
+      await app.close();
+    } finally {
+      await sql.end();
+    }
+  });
+
+  // G6 (Acme Phase 47 / AGW-08): the correlation id must reach the
+  // operator-registered upstream, so the backend's own audit row can be joined
+  // to this gateway's record. Asserted on the RECEIVED request recorded by the
+  // real ephemeral upstream — "we set a header" and "the header arrived" are
+  // different claims and only the second one is worth anything here.
+  it('relays an inbound x-correlation-id to the registered upstream verbatim', async () => {
+    const { db, sql } = getDb(cfg);
+    try {
+      const { agent, apiKey } = await registerAgent(db, { name: `mcp-corr-${Date.now()}`, tenant: 'test', allowedTools: ['echo'] });
+      await seedBudget(db, agent.id, 1_000_000, 1_000_000);
+      await putCredential(db, cfg, agent.id, 'mcp:echo', 'backend-token-xyz', `http://127.0.0.1:${upstream.port}/tool`);
+      const app = buildServer({ cfg, db, engine });
+
+      const correlationId = randomUUID();
+      const before = upstream.requests.length;
+      const res = await app.inject({
+        method: 'POST',
+        url: '/mcp/echo',
+        headers: { 'x-api-key': apiKey, 'x-correlation-id': correlationId },
+        payload: { operation: 'call', args: { msg: 'hi' } },
+      });
+
+      expect(res.statusCode).toBe(200);
+      expect(upstream.requests.length).toBe(before + 1);
+      const received = upstream.requests[upstream.requests.length - 1];
+      expect(received.headers['x-correlation-id']).toBe(correlationId);
+      // The existing properties are unaffected by the added header.
+      expect(received.headers['authorization']).toBe('Bearer backend-token-xyz');
+      expect(received.body).toEqual({ operation: 'call', args: { msg: 'hi' } });
+
+      await app.close();
+    } finally {
+      await sql.end();
+    }
+  });
+
+  // The `?? randomUUID()` fallback at planes/mcp.ts:56 must reach the upstream
+  // too: a mediated call is joinable even when the caller supplies nothing, so
+  // an un-instrumented client cannot produce an unjoinable gateway record.
+  it('relays a server-minted x-correlation-id when the caller sends none', async () => {
+    const { db, sql } = getDb(cfg);
+    try {
+      const { agent, apiKey } = await registerAgent(db, { name: `mcp-corr-mint-${Date.now()}`, tenant: 'test', allowedTools: ['echo'] });
+      await seedBudget(db, agent.id, 1_000_000, 1_000_000);
+      await putCredential(db, cfg, agent.id, 'mcp:echo', 'backend-token-xyz', `http://127.0.0.1:${upstream.port}/tool`);
+      const app = buildServer({ cfg, db, engine });
+
+      const before = upstream.requests.length;
+      const res = await app.inject({
+        method: 'POST',
+        url: '/mcp/echo',
+        headers: { 'x-api-key': apiKey },
+        payload: { operation: 'call', args: { msg: 'hi' } },
+      });
+
+      expect(res.statusCode).toBe(200);
+      expect(upstream.requests.length).toBe(before + 1);
+      const received = upstream.requests[upstream.requests.length - 1];
+      expect(received.headers['x-correlation-id']).toMatch(
+        /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i,
+      );
 
       await app.close();
     } finally {
