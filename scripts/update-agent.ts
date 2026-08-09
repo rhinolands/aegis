@@ -375,6 +375,33 @@ export async function updateAgent(
         'Nothing was written.',
       );
     }
+    // The tool name is appended to the base path VERBATIM two lines below, so
+    // it is as load-bearing for the destination as the base itself — and
+    // assertMcpBase validates only the base. Concrete bad end-state without
+    // this guard: `--mcp-tool '../../../api/blueprints'` registers a live
+    // credential whose stored URL WHATWG normalization (which fetch applies)
+    // collapses to a whole-tenant Acme route the exec path does not serve,
+    // carrying the gateway-injected PAT — every other Acme tenant route accepts
+    // that bearer, because scope is enforced only at the exec endpoint. A
+    // query, fragment, path separator, percent-escape or space does the same
+    // thing more quietly. `encodeURIComponent` is not a fix here:
+    // `encodeURIComponent('..') === '..'`.
+    //
+    // REFUSE, never sanitize (ASVS V5): a rewritten name would silently
+    // register a target the caller never asked for, and `policy/bundle/
+    // gateway.rego` matches allowedTools by plain set membership — so a
+    // silently-altered name is a permanent, invisible deny. This is a CHARSET
+    // check, deliberately not a catalog-membership check: Aegis has no Acme
+    // tool catalog, and inventing one here was correctly declined above.
+    const TOOL_NAME = /^[A-Za-z0-9_-]+(\.[A-Za-z0-9_-]+)*$/;
+    for (const tool of trimmed) {
+      if (!TOOL_NAME.test(tool)) {
+        throw new Error(
+          `--mcp-tool "${tool}" contains URL-reserved or dot-segment characters; ` +
+          `the value is appended to the upstream path verbatim. Nothing was written.`,
+        );
+      }
+    }
     const base = assertMcpBase(opts.mcpUpstreamBase as string);
     for (const tool of new Set(trimmed)) {
       mcpPairs.push({ target: `mcp:${tool}`, upstreamUrl: `${base}/${tool}` });

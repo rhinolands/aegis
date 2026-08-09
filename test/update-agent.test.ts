@@ -337,6 +337,104 @@ describe('update-agent CLI core', () => {
     }
   });
 
+  it('refuses a --mcp-tool value carrying dot segments before any write, leaving credentials byte-identical (WR-02)', async () => {
+    const { db, sql } = getDb(cfg);
+    try {
+      const name = freshName('mcptraversal');
+      const { agent } = await registerAgent(db, { name, tenant: 'test', allowedTools: ['acme-none'] });
+      await updateAgent(db, cfg, {
+        agentName: name, mcpTools: [TOOL_READ], mcpUpstreamBase: MCP_BASE, secret: 'pat-real',
+      });
+      const beforeCreds = await credentialSnapshot(db, agent.id);
+
+      // The exact value from the Phase-46 review (WR-02). `${base}/${tool}`
+      // yields `…/internal/mcp/tools/../../../api/blueprints`, which the WHATWG
+      // URL normalization inside fetch() collapses to `…/api/blueprints` — a
+      // REGISTERED credential pointing at a whole-tenant Acme route the exec
+      // path does not serve, carrying the gateway-injected PAT. `encodeURIComponent`
+      // does not help: it leaves `..` unchanged.
+      await expect(updateAgent(db, cfg, {
+        agentName: name,
+        allowTools: [TOOL_READ, TOOL_PROPOSE],
+        mcpTools: ['../../../api/blueprints'],
+        mcpUpstreamBase: MCP_BASE,
+        secret: 'pat-real',
+      })).rejects.toThrow(/--mcp-tool/);
+
+      // Property 2 of this file's header: read the state back, do not trust the
+      // throw. The refusal must precede the FIRST write, so the tools column
+      // still holds its registration placeholder and every credential row is
+      // byte-identical to the snapshot taken above.
+      const [row] = await db.select().from(agents).where(eq(agents.id, agent.id)).limit(1);
+      expect(row.allowedTools).toEqual(['acme-none']);
+      expect(await credentialSnapshot(db, agent.id)).toEqual(beforeCreds);
+      expect(await mcpRowCount(db, agent.id, '../../../api/blueprints')).toBe(0);
+    } finally {
+      await sql.end();
+    }
+  });
+
+  it('refuses every URL-reserved character in a --mcp-tool value, leaving credentials byte-identical (WR-02)', async () => {
+    const { db, sql } = getDb(cfg);
+    try {
+      const name = freshName('mcpreserved');
+      const { agent } = await registerAgent(db, { name, tenant: 'test', allowedTools: ['acme-none'] });
+      await updateAgent(db, cfg, {
+        agentName: name, mcpTools: [TOOL_READ], mcpUpstreamBase: MCP_BASE, secret: 'pat-real',
+      });
+      const beforeCreds = await credentialSnapshot(db, agent.id);
+
+      // One value per reserved character that changes where the stored URL
+      // resolves: a path separator, a query, a fragment, a percent-escape (the
+      // encoded form of a dot segment) and a raw space. None survives a trim,
+      // so the existing empty-after-trim refusal cannot be what rejects them.
+      const RESERVED = [
+        'acme/blueprint.read',
+        'acme.blueprint?x=1',
+        'acme.blueprint#frag',
+        'acme.%2e%2e',
+        'acme.blueprint read',
+      ];
+      for (const badTool of RESERVED) {
+        await expect(updateAgent(db, cfg, {
+          agentName: name, mcpTools: [badTool], mcpUpstreamBase: MCP_BASE, secret: 'pat-real',
+        })).rejects.toThrow(/--mcp-tool/);
+        expect(await credentialSnapshot(db, agent.id)).toEqual(beforeCreds);
+      }
+    } finally {
+      await sql.end();
+    }
+  });
+
+  it('still accepts an ordinary dotted, underscored or hyphenated tool name (WR-02 non-vacuity)', async () => {
+    const { db, sql } = getDb(cfg);
+    try {
+      const name = freshName('mcpcharsetok');
+      const { agent } = await registerAgent(db, { name, tenant: 'test', allowedTools: ['acme-none'] });
+
+      // The positive control: a guard that rejected everything would pass the
+      // two refusal cases above vacuously (the `allowlist-ceiling.test.ts:44`
+      // idiom). Every character class the charset permits is exercised here —
+      // dots between segments, an underscore and a hyphen inside one.
+      const ok = await updateAgent(db, cfg, {
+        agentName: name,
+        mcpTools: [TOOL_READ, TOOL_PROPOSE, 'acme_lane-01'],
+        mcpUpstreamBase: MCP_BASE,
+        secret: 'pat-real',
+      });
+      expect(ok.mcpCredentials.map((c) => c.target))
+        .toEqual([`mcp:${TOOL_READ}`, `mcp:${TOOL_PROPOSE}`, 'mcp:acme_lane-01']);
+      for (const written of ok.mcpCredentials) expect(written.rowCount).toBe(1);
+
+      // The shipped happy path is unchanged: the row reads back with its path intact.
+      const read = await getCredentialTarget(db, cfg, agent.id, `mcp:${TOOL_READ}`);
+      expect(read?.upstreamUrl).toBe(`${MCP_BASE}/${TOOL_READ}`);
+      expect(read?.upstreamUrl).toContain('/internal/mcp/tools/');
+    } finally {
+      await sql.end();
+    }
+  });
+
   it('refuses an mcp credential write when no secret is supplied — it is never a flag', async () => {
     const { db, sql } = getDb(cfg);
     try {
