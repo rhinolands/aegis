@@ -454,8 +454,18 @@ export async function updateAgent(
     // DELETE-then-INSERT, never a bare INSERT: there is no unique constraint to
     // stop a second row and no ORDER BY on the read that would make a duplicate
     // resolve predictably.
-    await db.delete(scopedCredentials).where(credWhere);
-    await putCredential(db, cfg, agent.id, LLM_TARGET, secret as string, upstreamOrigin as string);
+    //
+    // ONE TRANSACTION AROUND BOTH STATEMENTS. Run as two autocommit statements
+    // (as they were until WR-05), a fault between them — putCredential's
+    // encrypt step throwing, a connection drop, the process dying — leaves the
+    // pre-existing working key deleted and nothing in its place. The tenant's
+    // governed LLM traffic then fails closed on every call until an operator
+    // re-seeds, and the count==1 post-condition below cannot catch it: that
+    // check only runs when the process survives to reach it.
+    await db.transaction(async (tx) => {
+      await tx.delete(scopedCredentials).where(credWhere);
+      await putCredential(tx, cfg, agent.id, LLM_TARGET, secret as string, upstreamOrigin as string);
+    });
   }
 
   // Hard post-condition. Reported on every run, asserted only when we wrote —
@@ -483,8 +493,16 @@ export async function updateAgent(
       eq(scopedCredentials.agentId, agent.id),
       eq(scopedCredentials.target, pair.target),
     );
-    await db.delete(scopedCredentials).where(where);
-    await putCredential(db, cfg, agent.id, pair.target, secret as string, pair.upstreamUrl);
+    // The same single transaction around the swap as the LLM target above,
+    // once per pair — identical wrapper shape, because the "copied in shape on
+    // purpose" note above is only true while both paths carry it. Scoped per
+    // pair rather than around the whole loop so a fault on pair N cannot undo
+    // the pairs already written; the throw aborts the loop, so no later pair is
+    // half-applied either.
+    await db.transaction(async (tx) => {
+      await tx.delete(scopedCredentials).where(where);
+      await putCredential(tx, cfg, agent.id, pair.target, secret as string, pair.upstreamUrl);
+    });
     const [{ n: mcpN }] = await db
       .select({ n: dsql<number>`count(*)::int` })
       .from(scopedCredentials)

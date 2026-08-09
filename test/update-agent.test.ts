@@ -61,6 +61,14 @@ const UNPRICED_MODEL = 'claude-sonnet-4-6-20260301';
 
 const ORIGIN = 'https://api.anthropic.com';
 
+// WR-05 fault injection. Identical to the real config except for an AES key of
+// the wrong length, which makes `createCipheriv` inside
+// putCredential -> encryptPayload throw SYNCHRONOUSLY — i.e. the fault lands in
+// exactly the window WR-05 is about: after the DELETE has run and before the
+// INSERT. The injection point is the `cfg` argument updateAgent already takes,
+// so nothing in the script is restructured to make it testable.
+const FAULTY_CFG = { ...cfg, auditMasterKey: Buffer.alloc(8) };
+
 // The real shape the Acme seed will pass: an in-cluster http origin carrying the
 // exec path. Both halves matter — `http:` because there is no TLS on a cluster
 // service DNS name, and the path because the MCP plane fetches this URL verbatim.
@@ -543,6 +551,94 @@ describe('update-agent CLI core', () => {
       expect(await credentialRowCount(db, agent.id)).toBe(1);
       const read = await getCredentialTarget(db, cfg, agent.id, LLM_TARGET);
       expect(read?.secret).toBe('upstream-key-real');
+    } finally {
+      await sql.end();
+    }
+  });
+
+  it('rolls the llm credential swap back when the insert faults, leaving the pre-existing credential resolvable (WR-05)', async () => {
+    const { db, sql } = getDb(cfg);
+    try {
+      const name = freshName('llmrollback');
+      const { agent } = await registerAgent(db, { name, tenant: 'test', allowedTools: ['acme-none'] });
+      await updateAgent(db, cfg, {
+        agentName: name, setCredential: true, secret: 'upstream-key-original', upstreamUrl: ORIGIN,
+      });
+      expect(await credentialRowCount(db, agent.id)).toBe(1);
+
+      // The replacement is DELETE-then-INSERT. Fault the INSERT and the
+      // pre-existing working key is gone with nothing in its place: the LLM
+      // plane then fails closed on every call for this agent until an operator
+      // re-seeds. The count==1 post-condition below the swap cannot save it —
+      // it only runs when the process survives that far, and here it does not.
+      await expect(updateAgent(db, FAULTY_CFG, {
+        agentName: name, setCredential: true, secret: 'upstream-key-replacement', upstreamUrl: ORIGIN,
+      })).rejects.toThrow(/invalid key length/i);
+
+      // Property 1 of this file's header: read it back. The DELETE must have
+      // rolled back with the failed INSERT, so the ORIGINAL secret — not the
+      // replacement, and not nothing — still resolves.
+      expect(await credentialRowCount(db, agent.id)).toBe(1);
+      const survived = await getCredentialTarget(db, cfg, agent.id, LLM_TARGET);
+      expect(survived?.secret).toBe('upstream-key-original');
+      expect(survived?.upstreamUrl).toBe(ORIGIN);
+
+      // Positive control: the transaction must not change the happy path. A
+      // normal, non-faulting run still replaces the value and still collapses
+      // to exactly one row.
+      const ok = await updateAgent(db, cfg, {
+        agentName: name, setCredential: true, secret: 'upstream-key-replacement', upstreamUrl: ORIGIN,
+      });
+      expect(ok.credentialRowCount).toBe(1);
+      expect(await credentialRowCount(db, agent.id)).toBe(1);
+      expect((await getCredentialTarget(db, cfg, agent.id, LLM_TARGET))?.secret)
+        .toBe('upstream-key-replacement');
+    } finally {
+      await sql.end();
+    }
+  });
+
+  it('rolls each mcp:<tool> credential swap back when the insert faults, leaving every pre-existing credential resolvable (WR-05)', async () => {
+    const { db, sql } = getDb(cfg);
+    try {
+      const name = freshName('mcprollback');
+      const { agent } = await registerAgent(db, { name, tenant: 'test', allowedTools: ['acme-none'] });
+      await updateAgent(db, cfg, {
+        agentName: name, mcpTools: [TOOL_READ, TOOL_PROPOSE], mcpUpstreamBase: MCP_BASE,
+        secret: 'pat-original',
+      });
+      expect(await mcpRowCount(db, agent.id, TOOL_READ)).toBe(1);
+      expect(await mcpRowCount(db, agent.id, TOOL_PROPOSE)).toBe(1);
+
+      // Two pairs, so this asserts the per-pair loop's atomicity twice over:
+      // the FIRST pair's swap must roll back (its own transaction), and the
+      // throw must abort the loop before the SECOND pair is touched at all.
+      // Either way no target is left with zero rows.
+      await expect(updateAgent(db, FAULTY_CFG, {
+        agentName: name, mcpTools: [TOOL_READ, TOOL_PROPOSE], mcpUpstreamBase: MCP_BASE,
+        secret: 'pat-replacement',
+      })).rejects.toThrow(/invalid key length/i);
+
+      expect(await mcpRowCount(db, agent.id, TOOL_READ)).toBe(1);
+      expect(await mcpRowCount(db, agent.id, TOOL_PROPOSE)).toBe(1);
+      const readSurvived = await getCredentialTarget(db, cfg, agent.id, `mcp:${TOOL_READ}`);
+      expect(readSurvived?.secret).toBe('pat-original');
+      expect(readSurvived?.upstreamUrl).toBe(`${MCP_BASE}/${TOOL_READ}`);
+      const proposeSurvived = await getCredentialTarget(db, cfg, agent.id, `mcp:${TOOL_PROPOSE}`);
+      expect(proposeSurvived?.secret).toBe('pat-original');
+      expect(proposeSurvived?.upstreamUrl).toBe(`${MCP_BASE}/${TOOL_PROPOSE}`);
+
+      // Positive control, same as the llm case: the wrapper must leave the
+      // shipped replace-and-assert-count-1 behaviour exactly as it was.
+      const ok = await updateAgent(db, cfg, {
+        agentName: name, mcpTools: [TOOL_READ, TOOL_PROPOSE], mcpUpstreamBase: MCP_BASE,
+        secret: 'pat-replacement',
+      });
+      for (const written of ok.mcpCredentials) expect(written.rowCount).toBe(1);
+      expect((await getCredentialTarget(db, cfg, agent.id, `mcp:${TOOL_READ}`))?.secret)
+        .toBe('pat-replacement');
+      expect((await getCredentialTarget(db, cfg, agent.id, `mcp:${TOOL_PROPOSE}`))?.secret)
+        .toBe('pat-replacement');
     } finally {
       await sql.end();
     }
