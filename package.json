@@ -12,6 +12,7 @@
     "start": "node dist/index.js",
     "register": "tsx scripts/register.ts",
     "update-agent": "tsx scripts/update-agent.ts",
+    "ledger": "tsx scripts/ledger.ts",
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
     "test:opa": "opa test policy/bundle -v",
