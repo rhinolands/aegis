@@ -236,6 +236,71 @@ describe('the usage clamp — an upstream can never credit or overflow the meter
   });
 });
 
+describe('the 1-hour cache-write class — DEBT-05', () => {
+  it('meters a 1-hour cache write at 2x input, not the 5-minute 1.25x (RED against the pre-fix meter)', () => {
+    // Anthropic bills a 1-hour cache write at 2x base input, a 5-minute write at
+    // 1.25x. A 200,000-token 1h write on Sonnet is 200000/1000 * 6000 =
+    // 1,200,000 micros. The PRE-FIX meter had no 1h class: the same tokens flowed
+    // through the 5-minute rate at 200000/1000 * 3750 = 750,000 — a 1.6x
+    // under-meter. If a future edit mis-prices the 1h class at 1.25x this returns
+    // 750,000 and this assertion goes RED, which is the D-11 mutation ritual.
+    const { costMicros, priced } = priceMicros('claude-sonnet-4-6', 0, 0, 0, 0, 200_000);
+    expect(priced).toBe(true);
+    expect(costMicros).toBe(1_200_000);
+    expect(costMicros).not.toBe(750_000);
+  });
+
+  it('holds on Haiku too — 1h write is input * 2 (2000/1K), not the 5m 1250/1K', () => {
+    // Haiku input 1000 -> 1h write 2000. 100,000 tokens = 100 * 2000 = 200,000
+    // micros; the pre-fix 5m path would have returned 100 * 1250 = 125,000.
+    const { costMicros } = priceMicros('claude-haiku-4-5-20251001', 0, 0, 0, 0, 100_000);
+    expect(costMicros).toBe(200_000);
+    expect(costMicros).not.toBe(125_000);
+  });
+
+  it('splits the anthropic cache_creation breakdown into 5m and 1h classes', () => {
+    // When the per-TTL breakdown object is present, ephemeral_5m -> cacheWrite
+    // (5m) and ephemeral_1h -> cacheWrite1h. The flat top-level count is their
+    // sum and is NOT double-counted.
+    const u = extractUsage('anthropic', {
+      usage: {
+        cache_creation: { ephemeral_5m_input_tokens: 0, ephemeral_1h_input_tokens: 200_000 },
+        cache_creation_input_tokens: 200_000,
+      },
+    });
+    expect(u.cacheWrite).toBe(0);
+    expect(u.cacheWrite1h).toBe(200_000);
+  });
+
+  it('routes a mixed 5m/1h breakdown to both classes independently', () => {
+    const u = extractUsage('anthropic', {
+      usage: {
+        cache_creation: { ephemeral_5m_input_tokens: 30_000, ephemeral_1h_input_tokens: 70_000 },
+        cache_creation_input_tokens: 100_000,
+      },
+    });
+    expect(u.cacheWrite).toBe(30_000);
+    expect(u.cacheWrite1h).toBe(70_000);
+    // And the two classes price at their own rates when summed through priceMicros.
+    const { costMicros } = priceMicros('claude-sonnet-4-6', 0, 0, u.cacheWrite, 0, u.cacheWrite1h);
+    // 30 * 3750 (5m) + 70 * 6000 (1h) = 112,500 + 420,000 = 532,500
+    expect(costMicros).toBe(532_500);
+  });
+
+  it('falls back to the flat cache_creation_input_tokens as a 5m write when no breakdown is present', () => {
+    // Byte-identical to the pre-fix behaviour for upstreams that do not emit the
+    // per-TTL split: the flat field is metered as a 5-minute write, cacheWrite1h 0.
+    const u = extractUsage('anthropic', { usage: { cache_creation_input_tokens: 200_000 } });
+    expect(u.cacheWrite).toBe(200_000);
+    expect(u.cacheWrite1h).toBe(0);
+  });
+
+  it('coerces a negative or absurd 1h count to 0 — the clamp covers the new arg too', () => {
+    expect(priceMicros('claude-sonnet-4-6', 0, 0, 0, 0, -1_000_000).costMicros).toBe(0);
+    expect(priceMicros('claude-sonnet-4-6', 0, 0, 0, 0, Number.MAX_VALUE).costMicros).toBe(0);
+  });
+});
+
 describe('MODEL_PRICES — table shape invariants', () => {
   it('contains exactly the two model ids Acme sends, and nothing else', () => {
     // A placeholder row reappearing (claude-sonnet-5 / claude-opus-4-8, both
@@ -259,23 +324,26 @@ describe('MODEL_PRICES — table shape invariants', () => {
       inputMicrosPer1K: 3_000,
       outputMicrosPer1K: 15_000,
       cacheWriteMicrosPer1K: 3_750,
+      cacheWrite1hMicrosPer1K: 6_000,
       cacheReadMicrosPer1K: 300,
     });
     expect(MODEL_PRICES['claude-haiku-4-5-20251001']).toEqual({
       inputMicrosPer1K: 1_000,
       outputMicrosPer1K: 5_000,
       cacheWriteMicrosPer1K: 1_250,
+      cacheWrite1hMicrosPer1K: 2_000,
       cacheReadMicrosPer1K: 100,
     });
   });
 
   it('holds the published cache multipliers as a ratio on every row, not just on one', () => {
     // Anthropic publishes cache pricing as a MULTIPLIER of the base input rate
-    // (5-minute write 1.25x, read 0.1x), so the relationship — not just the
-    // absolute figure — is the thing to pin. A future model row added with a
-    // hand-typed cache rate that does not hold the ratio fails here.
+    // (5-minute write 1.25x, 1-hour write 2x, read 0.1x), so the relationship —
+    // not just the absolute figure — is the thing to pin. A future model row
+    // added with a hand-typed cache rate that does not hold the ratio fails here.
     for (const [model, price] of Object.entries(MODEL_PRICES)) {
-      expect(price.cacheWriteMicrosPer1K, `${model} cache write`).toBe(price.inputMicrosPer1K * 1.25);
+      expect(price.cacheWriteMicrosPer1K, `${model} cache write 5m`).toBe(price.inputMicrosPer1K * 1.25);
+      expect(price.cacheWrite1hMicrosPer1K, `${model} cache write 1h`).toBe(price.inputMicrosPer1K * 2);
       expect(price.cacheReadMicrosPer1K, `${model} cache read`).toBe(price.inputMicrosPer1K * 0.1);
     }
   });
@@ -304,6 +372,7 @@ describe('MODEL_PRICES — table shape invariants', () => {
         inputMicrosPer1K: 0,
         outputMicrosPer1K: 0,
         cacheWriteMicrosPer1K: 0,
+        cacheWrite1hMicrosPer1K: 0,
         cacheReadMicrosPer1K: 0,
       };
     }).toThrow(TypeError);
