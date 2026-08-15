@@ -11,20 +11,24 @@
  */
 
 /**
- * Four rates, never one, and never two. Every field is micros per 1,000 tokens.
+ * Five rates, never one, and never two. Every field is micros per 1,000 tokens.
  *
- * Anthropic bills four distinct token classes and `usage.input_tokens` EXCLUDES
- * both cache classes, so pricing only input and output does not under-meter a
- * cached call slightly — it misses almost all of it (CR-02).
+ * Anthropic bills distinct token classes and `usage.input_tokens` EXCLUDES all
+ * cache classes, so pricing only input and output does not under-meter a cached
+ * call slightly — it misses almost all of it (CR-02).
  *
- * `cacheWriteMicrosPer1K` is the FIVE-MINUTE cache write. See the WHICH CACHE
- * WRITE note in the verified block below for why, and for the one case this
- * under-meters.
+ * There are TWO cache-write rates because Anthropic prices a cache write by its
+ * TTL: `cacheWriteMicrosPer1K` is the FIVE-MINUTE write (1.25x base input) and
+ * `cacheWrite1hMicrosPer1K` is the ONE-HOUR write (2x base input). The per-TTL
+ * split arrives in `usage.cache_creation.{ephemeral_5m,ephemeral_1h}_input_tokens`;
+ * the flat top-level `cache_creation_input_tokens` is their sum. See the WHICH
+ * CACHE WRITE note in the verified block below (DEBT-05 closed the 1h gap).
  */
 export interface ModelPrice {
   inputMicrosPer1K: number;
   outputMicrosPer1K: number;
   cacheWriteMicrosPer1K: number;
+  cacheWrite1hMicrosPer1K: number;
   cacheReadMicrosPer1K: number;
 }
 
@@ -86,8 +90,8 @@ export interface ModelPrice {
 //
 //  Derivation into this table's units, same x1000 rule as the base rates:
 //
-//    Sonnet 4.6  input 3000  ->  write 3000 x 1.25 = 3750   read 3000 x 0.10 = 300
-//    Haiku 4.5   input 1000  ->  write 1000 x 1.25 = 1250   read 1000 x 0.10 = 100
+//    Sonnet 4.6  input 3000  ->  write5m 3000 x 1.25 = 3750  write1h 3000 x 2 = 6000  read 3000 x 0.10 = 300
+//    Haiku 4.5   input 1000  ->  write5m 1000 x 1.25 = 1250  write1h 1000 x 2 = 2000  read 1000 x 0.10 = 100
 //
 //      check against the absolute source: $3.75/MTok x 1000 = 3,750 micros/1K
 //      and $0.30/MTok x 1000 = 300 micros/1K. Both agree with the multiplier
@@ -99,16 +103,20 @@ export interface ModelPrice {
 //  $3.75/MTok should cost. If a future edit makes this figure come out at $750
 //  or $0.00075 the unit has been dropped or added somewhere.
 //
-//  WHICH CACHE WRITE — a KNOWN, DELIBERATE, CONSERVATIVE UNDER-METER. Anthropic
-//  bills a 1-hour cache write at 2x, not 1.25x, but the top-level
-//  `cache_creation_input_tokens` field this module is fed does not say which
-//  TTL produced it (the per-TTL split lives in a separate `cache_creation`
-//  breakdown object that neither the tee nor extractUsage reads today). We
-//  price the 5-minute rate because it is the default TTL. A caller using the
-//  1-hour TTL is therefore metered at 1.25x while being billed 2x — a 1.6x
-//  under-meter on that class only. This is recorded rather than hidden: it is
-//  strictly better than the 0x it replaces, and closing it means reading the
-//  per-TTL breakdown, which is a separate change with its own test.
+//  WHICH CACHE WRITE — both TTLs are now priced as their own class (DEBT-05,
+//  closed 2026-08-15). Anthropic bills a 1-hour cache write at 2x and a
+//  5-minute write at 1.25x. The per-TTL split arrives in the `cache_creation`
+//  breakdown object — `usage.cache_creation.{ephemeral_5m_input_tokens,
+//  ephemeral_1h_input_tokens}` — whose sum is the flat top-level
+//  `cache_creation_input_tokens`. Both extractUsage (buffered) and the SSE tee
+//  (streaming) read the breakdown when present, routing ephemeral_5m to
+//  cacheWrite (1.25x) and ephemeral_1h to cacheWrite1h (2x); when NO breakdown
+//  is present the flat field is metered as a 5-minute write (byte-identical to
+//  the pre-DEBT-05 behaviour for upstreams that do not emit the split). The
+//  earlier 1.6x under-meter on the 1h class — the conservative gap this block
+//  used to record — no longer exists; a 1h caller is now metered at the 2x rate
+//  it is billed at, proven RED/GREEN in test/pricing.test.ts (750,000 pre-fix
+//  vs 1,200,000 fixed on a 200K-token 1h write).
 //
 //  RE-VERIFY OBLIGATION: before any figure derived from this table is shown to
 //  a user, put on an invoice, or used to justify a budget cap to an operator,
@@ -144,12 +152,14 @@ export const MODEL_PRICES: Readonly<Record<string, Readonly<ModelPrice>>> = Obje
     inputMicrosPer1K: 1000,
     outputMicrosPer1K: 5000,
     cacheWriteMicrosPer1K: 1250,
+    cacheWrite1hMicrosPer1K: 2000,
     cacheReadMicrosPer1K: 100,
   }),
   'claude-sonnet-4-6': Object.freeze({
     inputMicrosPer1K: 3000,
     outputMicrosPer1K: 15000,
     cacheWriteMicrosPer1K: 3750,
+    cacheWrite1hMicrosPer1K: 6000,
     cacheReadMicrosPer1K: 300,
   }),
 });
@@ -234,23 +244,32 @@ const n = (v: unknown): number => {
 export function extractUsage(
   style: 'anthropic' | 'openai',
   body: unknown,
-): { input: number; output: number; cacheWrite: number; cacheRead: number } {
+): { input: number; output: number; cacheWrite: number; cacheRead: number; cacheWrite1h: number } {
   const u = (body as { usage?: Record<string, unknown> } | null | undefined)?.usage;
-  if (!u) return { input: 0, output: 0, cacheWrite: 0, cacheRead: 0 };
+  if (!u) return { input: 0, output: 0, cacheWrite: 0, cacheRead: 0, cacheWrite1h: 0 };
   if (style === 'anthropic') {
+    // Prefer the per-TTL breakdown when present: ephemeral_5m -> cacheWrite (5m,
+    // 1.25x), ephemeral_1h -> cacheWrite1h (1h, 2x). The flat top-level
+    // cache_creation_input_tokens is their SUM, so when the breakdown is present
+    // it must NOT be added on top or the write would be double-metered; when it
+    // is absent the flat field is the only signal and is metered as a 5m write
+    // (byte-identical to the pre-DEBT-05 behaviour).
+    const cc = u.cache_creation as Record<string, unknown> | null | undefined;
     return {
       input: n(u.input_tokens),
       output: n(u.output_tokens),
-      cacheWrite: n(u.cache_creation_input_tokens),
+      cacheWrite: cc ? n(cc.ephemeral_5m_input_tokens) : n(u.cache_creation_input_tokens),
       cacheRead: n(u.cache_read_input_tokens),
+      cacheWrite1h: cc ? n(cc.ephemeral_1h_input_tokens) : 0,
     };
   }
-  if (u.total_tokens != null) return { input: n(u.total_tokens), output: 0, cacheWrite: 0, cacheRead: 0 };
+  if (u.total_tokens != null) return { input: n(u.total_tokens), output: 0, cacheWrite: 0, cacheRead: 0, cacheWrite1h: 0 };
   return {
     input: n(u.prompt_tokens),
     output: n(u.completion_tokens),
     cacheWrite: 0,
     cacheRead: 0,
+    cacheWrite1h: 0,
   };
 }
 
@@ -264,11 +283,12 @@ export function extractUsage(
  * refusal, a worse failure than an audited zero — but it says so, and the
  * caller is responsible for making it loud.
  *
- * `cacheWrite` and `cacheRead` are OPTIONAL and default to 0 so that the
- * three-argument form keeps behaving exactly as it did: planes/llm.ts and
- * planes/llm-raw.ts still call it that way and are rewired by plan 45-13, not
- * here. A three-arg call is only correct for a turn with no cache tokens, which
- * is why the two settle sites are a follow-up rather than optional.
+ * `cacheWrite`, `cacheRead` and `cacheWrite1h` are OPTIONAL and default to 0 so
+ * that the three- and five-argument forms keep behaving exactly as they did:
+ * `cacheWrite1h` is appended AFTER `cacheRead` precisely so existing 3/5-arg
+ * call sites keep compiling untouched. A call that omits it is only correct for
+ * a turn with no 1-hour cache write, which is why the two settle sites pass it
+ * (DEBT-05) rather than leaving it dormant.
  */
 export function priceMicros(
   model: string,
@@ -276,6 +296,7 @@ export function priceMicros(
   output: number,
   cacheWrite = 0,
   cacheRead = 0,
+  cacheWrite1h = 0,
 ): { costMicros: number; priced: boolean } {
   const price = MODEL_PRICES[model];
   if (!price) return { costMicros: 0, priced: false };
@@ -289,6 +310,7 @@ export function priceMicros(
   const o = n(output);
   const cw = n(cacheWrite);
   const cr = n(cacheRead);
+  const cw1h = n(cacheWrite1h);
   // Each term is rounded INDEPENDENTLY and then summed — deliberately, not as
   // a rounding of the sum. The two are not the same number in general, and the
   // per-side form is what the worked examples in test/pricing.test.ts pin. The
@@ -299,6 +321,7 @@ export function priceMicros(
     Math.round((i / 1000) * price.inputMicrosPer1K) +
     Math.round((o / 1000) * price.outputMicrosPer1K) +
     Math.round((cw / 1000) * price.cacheWriteMicrosPer1K) +
+    Math.round((cw1h / 1000) * price.cacheWrite1hMicrosPer1K) +
     Math.round((cr / 1000) * price.cacheReadMicrosPer1K);
   return { costMicros, priced: true };
 }

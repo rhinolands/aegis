@@ -51,12 +51,13 @@ describe('extractUsage — untrusted upstream coercion', () => {
       output: 60,
       cacheWrite: 0,
       cacheRead: 0,
+      cacheWrite1h: 0,
     });
   });
 
   it('returns zeros for a body with no usage block and for a null body', () => {
-    expect(extractUsage('anthropic', {})).toEqual({ input: 0, output: 0, cacheWrite: 0, cacheRead: 0 });
-    expect(extractUsage('anthropic', null)).toEqual({ input: 0, output: 0, cacheWrite: 0, cacheRead: 0 });
+    expect(extractUsage('anthropic', {})).toEqual({ input: 0, output: 0, cacheWrite: 0, cacheRead: 0, cacheWrite1h: 0 });
+    expect(extractUsage('anthropic', null)).toEqual({ input: 0, output: 0, cacheWrite: 0, cacheRead: 0, cacheWrite1h: 0 });
   });
 
   it('reads openai-style prompt/completion token fields', () => {
@@ -65,6 +66,7 @@ describe('extractUsage — untrusted upstream coercion', () => {
       output: 20,
       cacheWrite: 0,
       cacheRead: 0,
+      cacheWrite1h: 0,
     });
   });
 
@@ -76,6 +78,7 @@ describe('extractUsage — untrusted upstream coercion', () => {
       output: 0,
       cacheWrite: 0,
       cacheRead: 0,
+      cacheWrite1h: 0,
     });
   });
 });
