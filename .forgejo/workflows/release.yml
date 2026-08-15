@@ -53,6 +53,14 @@ jobs:
       REGISTRY_NAMESPACE: ${{ vars.REGISTRY_NAMESPACE }}
       REGISTRY_PLAIN_HTTP: ${{ vars.REGISTRY_PLAIN_HTTP }}
       HELM_VERSION: v3.16.3
+      # The ct102 runner executes jobs inside the `node:20-bookworm` image
+      # (runner-config label `ct102:docker://node:20-bookworm`), which ships node
+      # only — no docker CLI, no helm. The host docker daemon IS reachable via the
+      # runner's `docker_host: automount` (socket + DOCKER_HOST injected), so the
+      # job self-installs the docker CLI + buildx plugin (static binaries) and drives
+      # the host daemon. Verify tooling in the ACTUAL job container, never on the CT host.
+      DOCKER_CLI_VERSION: "27.5.1"
+      BUILDX_VERSION: v0.19.3
     steps:
       - uses: actions/checkout@v4
 
@@ -72,8 +80,28 @@ jobs:
             echo "HELM_PLAIN_HTTP=" >> "$GITHUB_ENV"
           fi
 
-      - name: Show docker buildx (probe A1 — buildx present on ct102)
-        run: docker buildx version
+      - name: Install docker CLI + buildx (job image node:20-bookworm has neither; host daemon via docker_host automount)
+        # The static docker CLI talks to the host daemon over the automounted socket
+        # (DOCKER_HOST is injected by the runner). buildx is installed as a CLI plugin.
+        # Mirrors the self-provisioning helm step below — no apt, no host mutation.
+        run: |
+          set -euo pipefail
+          case "$(uname -m)" in
+            x86_64) DK_ARCH=x86_64; BX_ARCH=amd64 ;;
+            aarch64|arm64) DK_ARCH=aarch64; BX_ARCH=arm64 ;;
+            *) echo "unsupported runner arch: $(uname -m)" >&2; exit 1 ;;
+          esac
+          mkdir -p "$HOME/bin" "$HOME/.docker/cli-plugins"
+          curl -fsSL -o /tmp/docker.tgz "https://download.docker.com/linux/static/stable/${DK_ARCH}/docker-${DOCKER_CLI_VERSION}.tgz"
+          tar -xzf /tmp/docker.tgz -C /tmp
+          mv /tmp/docker/docker "$HOME/bin/docker"
+          curl -fsSL -o "$HOME/.docker/cli-plugins/docker-buildx" \
+            "https://github.com/docker/buildx/releases/download/${BUILDX_VERSION}/buildx-${BUILDX_VERSION}.linux-${BX_ARCH}"
+          chmod +x "$HOME/bin/docker" "$HOME/.docker/cli-plugins/docker-buildx"
+          echo "$HOME/bin" >> "$GITHUB_PATH"
+          export PATH="$HOME/bin:$PATH"
+          docker version           # Client (installed) + Server (host daemon via automount) — fails fast if the socket is not wired
+          docker buildx version
 
       - name: Install pinned Helm (probe A1 — ct102 has no helm; >=3.8 required for OCI, >=3.13 for --plain-http)
         run: |
