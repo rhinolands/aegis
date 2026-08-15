@@ -1,0 +1,125 @@
+# Tagged-release pipeline (OSS-02 SC3).
+#
+# On a `v*` tag pushed to the FORGEJO remote, build the versioned container image
+# and package+push the Helm chart to the homelab Forgejo OCI registry
+# (10.0.0.110:3000, D-04). A single VERSION derived from the tag is stamped into
+# BOTH artifacts (reproducible-from-tag, D-07): tag == image tag == chart version.
+#
+# Load-bearing constraint (49-RESEARCH Pitfall 1): GitHub-hosted cloud runners
+# cannot reach the private 10.0.0.x LAN registry, so this MUST run on the
+# self-hosted `ct102` runner (same runner as .forgejo/workflows/e2e.yml).
+#
+# Environment (verified in 49-RELEASE-PROOF.md, wave-0 probe):
+#   - ct102 has docker 29.3.1 + buildx v0.31.1; helm is ABSENT -> self-installed below.
+#   - 10.0.0.110:3000 is Forgejo's OCI registry, plain HTTP (no TLS); the host daemon
+#     has NO /etc/docker/daemon.json insecure-registries. So the HTTP allowance is
+#     scoped to a dedicated buildx builder (buildkitd config) rather than mutating the
+#     host daemon, and helm uses its native --plain-http flag.
+#   - Auth is the CI secret FORGEJO_REGISTRY_TOKEN (scope write:package). The user
+#     `rhinom` is public and hardcoded. The token embedded in the git-remote URL is
+#     NEVER used for registry auth and never referenced here (T-49-04-01).
+#
+# This authors the pipeline only. The LIVE tagged-release run (real publication,
+# danger-zone, operator/money-gated) is plan 49-06.
+
+name: release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  release:
+    runs-on: ct102
+    env:
+      REGISTRY: 10.0.0.110:3000
+      IMAGE: 10.0.0.110:3000/rhinom/aegis
+      CHART_REPO: oci://10.0.0.110:3000/rhinom
+      HELM_VERSION: v3.16.3
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Derive VERSION from the tag (single source of truth — D-07)
+        # v1.2.3 -> 1.2.3 ; this same VERSION stamps the image tag AND the chart
+        # version/appVersion, so the tag is the only place a release version is set.
+        run: echo "VERSION=${GITHUB_REF_NAME#v}" >> "$GITHUB_ENV"
+
+      - name: Show docker buildx (probe A1 — buildx present on ct102)
+        run: docker buildx version
+
+      - name: Install pinned Helm (probe A1 — ct102 has no helm; >=3.8 required for OCI, >=3.13 for --plain-http)
+        run: |
+          case "$(uname -m)" in
+            x86_64) HELM_ARCH=amd64 ;;
+            aarch64|arm64) HELM_ARCH=arm64 ;;
+            *) echo "unsupported runner arch: $(uname -m)" >&2; exit 1 ;;
+          esac
+          mkdir -p "$HOME/bin"
+          curl -fsSL -o /tmp/helm.tgz "https://get.helm.sh/helm-${HELM_VERSION}-linux-${HELM_ARCH}.tar.gz"
+          tar -xzf /tmp/helm.tgz -C /tmp
+          mv "/tmp/linux-${HELM_ARCH}/helm" "$HOME/bin/helm"
+          echo "$HOME/bin" >> "$GITHUB_PATH"
+          "$HOME/bin/helm" version
+
+      - name: Registry auth (CI secret only — token piped, never echoed; user `rhinom` is public)
+        # HTTP registry (probe A4): docker login would fail the HTTPS->HTTP handshake
+        # because the host daemon has no insecure-registries. So the buildkit builder
+        # (created below) reads credentials straight from ~/.docker/config.json — no
+        # `docker login` network handshake needed. helm gets its own --plain-http login.
+        env:
+          REG_TOKEN: ${{ secrets.FORGEJO_REGISTRY_TOKEN }}
+        run: |
+          umask 077
+          mkdir -p "$HOME/.docker"
+          AUTH="$(printf '%s:%s' 'rhinom' "$REG_TOKEN" | base64 | tr -d '\n')"
+          printf '{"auths":{"%s":{"auth":"%s"}}}\n' "$REGISTRY" "$AUTH" > "$HOME/.docker/config.json"
+          # helm keeps its own registry config; --plain-http talks HTTP to the registry.
+          printf '%s' "$REG_TOKEN" | helm registry login "$REGISTRY" --plain-http -u 'rhinom' --password-stdin
+
+      - name: Create HTTP-scoped buildx builder (do NOT mutate the host daemon — probe A4)
+        # buildkitd config marks the HTTP registry http+insecure for THIS build only;
+        # no /etc/docker/daemon.json change, no host daemon restart.
+        run: |
+          cat > /tmp/buildkitd.toml <<'EOF'
+          [registry."10.0.0.110:3000"]
+            http = true
+            insecure = true
+          EOF
+          docker buildx create --name aegis-release --use --driver docker-container --config /tmp/buildkitd.toml
+          docker buildx inspect --bootstrap
+
+      - name: Build + push image and record the digest (SC3 provenance)
+        # --metadata-file is the authoritative digest source: `imagetools inspect`
+        # (below) is not guaranteed over the plain-HTTP registry, so the pinnable
+        # digest for the SC3 citation is read from the build metadata.
+        run: |
+          docker buildx build --push \
+            --metadata-file /tmp/build-meta.json \
+            -t "${IMAGE}:${VERSION}" \
+            -t "${IMAGE}:latest" \
+            .
+          DIGEST="$(grep -o '"containerimage.digest": *"[^"]*"' /tmp/build-meta.json | grep -o 'sha256:[a-f0-9]\{64\}')"
+          echo "Image digest (authoritative, from build metadata): $DIGEST"
+          echo "IMAGE_DIGEST=$DIGEST" >> "$GITHUB_ENV"
+
+      - name: Emit image digest via imagetools inspect (SC3 citation; best-effort over HTTP)
+        # Kept for the SC3 pin as the research Pattern-1 citation; allowed to no-op if
+        # imagetools cannot negotiate the plain-HTTP registry — the digest above stands.
+        run: |
+          docker buildx imagetools inspect "${IMAGE}:${VERSION}" \
+            --format '{{println .Manifest.Digest}}' || \
+            echo "imagetools inspect unavailable over HTTP; using build-metadata digest ${IMAGE_DIGEST}"
+
+      - name: Package + push Helm chart (SAME tag-derived VERSION — D-07)
+        # --version/--app-version override Chart.yaml's 0.1.0 at package time only:
+        # no tracked-file mutation, no release commit, no drift. `helm push` infers the
+        # chart name (aegis) and tag (chart version) from the .tgz, so the OCI ref has
+        # no trailing name.
+        run: |
+          helm package helm/aegis --version "${VERSION}" --app-version "${VERSION}"
+          helm push "aegis-${VERSION}.tgz" "${CHART_REPO}" --plain-http
+
+      - name: Remove the scoped buildx builder
+        if: always()
+        run: docker buildx rm aegis-release || true
