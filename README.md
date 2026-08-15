@@ -62,8 +62,10 @@ This is the part worth reading the code for.
 
 ## What's actually built
 
-Verified by `npm test` (75 passing, including the MinIO export integration test
-under `RUN_S3_INTEGRATION=1`) and `opa test policy/bundle` (9 passing).
+Verified by `npm test` (180 passing across 25 test files as of v0.1+G, plus the
+MinIO export integration test, which reports a real vitest **skip** unless
+`RUN_S3_INTEGRATION=1`) and `opa test policy/bundle` (9 passing). The suite grows
+as features land — run `npm test` for the current count.
 
 **Complete and tested**
 - Config loading with fail-fast validation; Fastify server; health endpoint
@@ -87,6 +89,13 @@ under `RUN_S3_INTEGRATION=1`) and `opa test policy/bundle` (9 passing).
 - **LLM plane** — `POST /llm/:model`, model allowlist, governed passthrough with token metering into the budget
 
 For all three planes the upstream destination is **operator-configured, never caller-supplied** — see [why that matters](#the-destination-is-not-the-callers-to-choose).
+
+**Gateway additions (G1–G6, integration surface)** — these landed after the v0.1 core to make Aegis a drop-in enforcement point for a consuming product, and extend the same one-pipeline model without weakening deny-by-default or fail-closed:
+
+- **G1 — anthropic-compat raw passthrough** (`POST /v1/messages`): forwards the caller's exact bytes to the operator-registered upstream **origin** with the request path appended (path-preserving), injecting the scoped `llm:anthropic` credential server-side. The destination is never caller-supplied — a caller-named `upstreamUrl` is structurally unreadable on this route — and any upstream 3xx is rejected rather than followed.
+- **`mcp:<tool>` scoped credential targets**: the MCP plane resolves *both* the scoped backend credential **and** the destination from the single operator-registered `(agentId, mcp:<tool>)` row — never the request body — so a compromised agent cannot redirect its own injected credential to a server it controls.
+- **G6 — correlation-id relay**: the gateway relays the caller's correlation id — server-authored from the same normalized id the audit record is built from, so the relayed header and the audited record can never disagree — to the operator-registered upstream on the MCP, A2A, and LLM planes, so a backend's own audit row joins back to the gateway decision. It is an opaque token: it selects no destination, carries no authority, and gates nothing.
+- A published `gateway_code` deny vocabulary lets the consuming product switch on a stable machine-readable code and render its own refusal copy, while the wire refusal stays deliberately generic (it never reveals which control refused).
 
 - **Object-storage export** — daily JSONL segments + sha256 manifest + chain-head pointer, written to any S3-compatible store (MinIO, S3, Azure Blob, GCS via interop endpoint)
 - **Agent registration CLI** (`scripts/register.ts`) — the only way to create an agent identity, its tool/peer/model allowlist, and its scoped backend credential; returns the raw API key exactly once
