@@ -134,9 +134,10 @@ jobs:
           mkdir -p "$HOME/.docker"
           AUTH="$(printf '%s:%s' "$REG_USER" "$REG_TOKEN" | base64 | tr -d '\n')"
           printf '{"auths":{"%s":{"auth":"%s"}}}\n' "$REGISTRY" "$AUTH" > "$HOME/.docker/config.json"
-          # helm keeps its own registry config; HELM_PLAIN_HTTP is --plain-http only for
-          # a plain-HTTP registry, empty (dropped) for TLS.
-          printf '%s' "$REG_TOKEN" | helm registry login "$REGISTRY" ${HELM_PLAIN_HTTP} -u "$REG_USER" --password-stdin
+          # No `helm registry login`: helm 3.16 `registry login` has no --plain-http, and
+          # its registry-config uses the SAME auths format as docker's config.json. So the
+          # helm push step reads these credentials via `--registry-config ~/.docker/config.json`
+          # and does the HTTP negotiation with its own --plain-http flag (HELM_PLAIN_HTTP).
 
       - name: Create HTTP-scoped buildx builder (plain-HTTP registry only — do NOT mutate the host daemon — probe A4)
         # Only needed when the configured OCI registry (vars.REGISTRY_HOST) is plain HTTP:
@@ -184,7 +185,8 @@ jobs:
         # no trailing name. HELM_PLAIN_HTTP is --plain-http only for a plain-HTTP registry.
         run: |
           helm package helm/aegis --version "${VERSION}" --app-version "${VERSION}"
-          helm push "aegis-${VERSION}.tgz" "${CHART_REPO}" ${HELM_PLAIN_HTTP}
+          helm push "aegis-${VERSION}.tgz" "${CHART_REPO}" ${HELM_PLAIN_HTTP} \
+            --registry-config "$HOME/.docker/config.json"
 
       - name: Remove the scoped buildx builder
         if: always() && env.REGISTRY_PLAIN_HTTP == 'true'
