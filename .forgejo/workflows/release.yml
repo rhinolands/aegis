@@ -26,11 +26,11 @@
 #     and helm uses its native --plain-http flag. Against a normal TLS registry
 #     (REGISTRY_PLAIN_HTTP not "true"), the default builder is used and --plain-http
 #     is dropped, so the pipeline is generic.
-#   - Auth is the built-in Forgejo Actions token (github.token, auto-injected per run,
-#     scoped by `permissions: packages: write`) as the pushing actor (github.actor).
-#     No CI secret to create, no personal/shared token stored (Forgejo 14.0.3 supports
-#     the auto token pushing to its own package registry). The token embedded in the
-#     git-remote URL is NEVER used for registry auth and never referenced here (T-49-04-01).
+#   - Auth is a dedicated Forgejo token with package:write, stored as the Actions
+#     secret FORGEJO_REGISTRY_TOKEN (user = vars.REGISTRY_NAMESPACE, the namespace owner).
+#     The built-in Actions token (github.token) was REJECTED for package push on Forgejo
+#     14.0.3 ("401 reqPackageAccess", run 9452), so a real scoped token is required. The
+#     token embedded in the git-remote URL is NEVER used for registry auth (T-49-04-01).
 #
 # This authors the pipeline only. The LIVE tagged-release run (real publication,
 # danger-zone, operator/money-gated) is plan 49-06.
@@ -47,7 +47,6 @@ jobs:
     runs-on: ct102
     permissions:
       contents: read
-      packages: write
     env:
       REGISTRY: ${{ vars.REGISTRY_HOST }}
       REGISTRY_NAMESPACE: ${{ vars.REGISTRY_NAMESPACE }}
@@ -117,20 +116,25 @@ jobs:
           echo "$HOME/bin" >> "$GITHUB_PATH"
           "$HOME/bin/helm" version
 
-      - name: Registry auth (built-in Actions token — piped, never echoed)
+      - name: Registry auth (dedicated package:write token — piped, never echoed)
         # Credentials are written straight into ~/.docker/config.json (base64 auth,
         # umask 077, never echoed) so buildkit can consume them without a `docker login`
         # network handshake — required for the plain-HTTP registry (a plain `docker
         # login` would fail the HTTPS->HTTP handshake when the host daemon has no
         # insecure-registries) and harmless for a TLS registry.
-        # Auth = the auto-injected Forgejo Actions token (github.token) as the pushing
-        # actor (github.actor); scoped by the job `permissions: packages: write`. No CI
-        # secret to create, no personal/shared token stored (Forgejo 14.0.3 supports it).
+        # Auth = a dedicated Forgejo token with package:write, stored as the Actions
+        # secret FORGEJO_REGISTRY_TOKEN. The built-in Actions token (github.token) was
+        # rejected for package push on Forgejo 14.0.3 ("401 reqPackageAccess", run 9452),
+        # so a real scoped token is required. User = the registry namespace owner.
         env:
-          REG_USER: ${{ github.actor }}
-          REG_TOKEN: ${{ github.token }}
+          REG_USER: ${{ vars.REGISTRY_NAMESPACE }}
+          REG_TOKEN: ${{ secrets.FORGEJO_REGISTRY_TOKEN }}
         run: |
           umask 077
+          if [ -z "${REG_TOKEN}" ]; then
+            echo "FORGEJO_REGISTRY_TOKEN is not set — create a Forgejo token with package:write and add it as an Actions secret on this repo." >&2
+            exit 1
+          fi
           mkdir -p "$HOME/.docker"
           AUTH="$(printf '%s:%s' "$REG_USER" "$REG_TOKEN" | base64 | tr -d '\n')"
           printf '{"auths":{"%s":{"auth":"%s"}}}\n' "$REGISTRY" "$AUTH" > "$HOME/.docker/config.json"
