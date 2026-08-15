@@ -1,20 +1,31 @@
 # Tagged-release pipeline (OSS-02 SC3).
 #
 # On a `v*` tag pushed to the FORGEJO remote, build the versioned container image
-# and package+push the Helm chart to the homelab Forgejo OCI registry
-# (10.0.0.110:3000, D-04). A single VERSION derived from the tag is stamped into
-# BOTH artifacts (reproducible-from-tag, D-07): tag == image tag == chart version.
+# and package+push the Helm chart to the configured OCI registry (vars.REGISTRY_HOST,
+# D-04). A single VERSION derived from the tag is stamped into BOTH artifacts
+# (reproducible-from-tag, D-07): tag == image tag == chart version.
+#
+# Registry topology is NOT hardcoded — it is supplied via Forgejo Actions repo
+# variables so this file is generic/publishable:
+#   - vars.REGISTRY_HOST       the OCI registry host:port (e.g. the homelab registry)
+#   - vars.REGISTRY_NAMESPACE  the owner/namespace under it (e.g. rhinom)
+#   - vars.REGISTRY_PLAIN_HTTP "true" for a plain-HTTP registry; empty/false for TLS
+# IMAGE and CHART_REPO are DERIVED from these at runtime (Actions `env:` blocks cannot
+# reference sibling env vars, so they are computed in the "Derive VERSION" step).
 #
 # Load-bearing constraint (49-RESEARCH Pitfall 1): GitHub-hosted cloud runners
-# cannot reach the private 10.0.0.x LAN registry, so this MUST run on the
-# self-hosted `ct102` runner (same runner as .forgejo/workflows/e2e.yml).
+# cannot reach a private-LAN registry, so this MUST run on the self-hosted `ct102`
+# runner (same runner as .forgejo/workflows/e2e.yml).
 #
 # Environment (verified in 49-RELEASE-PROOF.md, wave-0 probe):
 #   - ct102 has docker 29.3.1 + buildx v0.31.1; helm is ABSENT -> self-installed below.
-#   - 10.0.0.110:3000 is Forgejo's OCI registry, plain HTTP (no TLS); the host daemon
-#     has NO /etc/docker/daemon.json insecure-registries. So the HTTP allowance is
-#     scoped to a dedicated buildx builder (buildkitd config) rather than mutating the
-#     host daemon, and helm uses its native --plain-http flag.
+#   - The homelab OCI registry is Forgejo's, plain HTTP (no TLS), so REGISTRY_PLAIN_HTTP
+#     is set "true" for the homelab run. In that mode the host daemon has NO
+#     /etc/docker/daemon.json insecure-registries, so the HTTP allowance is scoped to a
+#     dedicated buildx builder (buildkitd config) rather than mutating the host daemon,
+#     and helm uses its native --plain-http flag. Against a normal TLS registry
+#     (REGISTRY_PLAIN_HTTP not "true"), the default builder is used and --plain-http
+#     is dropped, so the pipeline is generic.
 #   - Auth is the built-in Forgejo Actions token (github.token, auto-injected per run,
 #     scoped by `permissions: packages: write`) as the pushing actor (github.actor).
 #     No CI secret to create, no personal/shared token stored (Forgejo 14.0.3 supports
@@ -38,17 +49,28 @@ jobs:
       contents: read
       packages: write
     env:
-      REGISTRY: 10.0.0.110:3000
-      IMAGE: 10.0.0.110:3000/rhinom/aegis
-      CHART_REPO: oci://10.0.0.110:3000/rhinom
+      REGISTRY: ${{ vars.REGISTRY_HOST }}
+      REGISTRY_NAMESPACE: ${{ vars.REGISTRY_NAMESPACE }}
+      REGISTRY_PLAIN_HTTP: ${{ vars.REGISTRY_PLAIN_HTTP }}
       HELM_VERSION: v3.16.3
     steps:
       - uses: actions/checkout@v4
 
-      - name: Derive VERSION from the tag (single source of truth — D-07)
+      - name: Derive VERSION + registry refs from the tag and repo vars (single source of truth — D-07)
         # v1.2.3 -> 1.2.3 ; this same VERSION stamps the image tag AND the chart
         # version/appVersion, so the tag is the only place a release version is set.
-        run: echo "VERSION=${GITHUB_REF_NAME#v}" >> "$GITHUB_ENV"
+        # IMAGE + CHART_REPO are derived here because Actions `env:` blocks cannot
+        # reference sibling env vars. HELM_PLAIN_HTTP is the conditional --plain-http
+        # flag (set only for a plain-HTTP registry; empty for a TLS registry).
+        run: |
+          echo "VERSION=${GITHUB_REF_NAME#v}" >> "$GITHUB_ENV"
+          echo "IMAGE=${REGISTRY}/${REGISTRY_NAMESPACE}/aegis" >> "$GITHUB_ENV"
+          echo "CHART_REPO=oci://${REGISTRY}/${REGISTRY_NAMESPACE}" >> "$GITHUB_ENV"
+          if [ "${REGISTRY_PLAIN_HTTP}" = "true" ]; then
+            echo "HELM_PLAIN_HTTP=--plain-http" >> "$GITHUB_ENV"
+          else
+            echo "HELM_PLAIN_HTTP=" >> "$GITHUB_ENV"
+          fi
 
       - name: Show docker buildx (probe A1 — buildx present on ct102)
         run: docker buildx version
@@ -68,10 +90,11 @@ jobs:
           "$HOME/bin/helm" version
 
       - name: Registry auth (built-in Actions token — piped, never echoed)
-        # HTTP registry (probe A4): docker login would fail the HTTPS->HTTP handshake
-        # because the host daemon has no insecure-registries. So the buildkit builder
-        # (created below) reads credentials straight from ~/.docker/config.json — no
-        # `docker login` network handshake needed. helm gets its own --plain-http login.
+        # Credentials are written straight into ~/.docker/config.json (base64 auth,
+        # umask 077, never echoed) so buildkit can consume them without a `docker login`
+        # network handshake — required for the plain-HTTP registry (a plain `docker
+        # login` would fail the HTTPS->HTTP handshake when the host daemon has no
+        # insecure-registries) and harmless for a TLS registry.
         # Auth = the auto-injected Forgejo Actions token (github.token) as the pushing
         # actor (github.actor); scoped by the job `permissions: packages: write`. No CI
         # secret to create, no personal/shared token stored (Forgejo 14.0.3 supports it).
@@ -83,15 +106,19 @@ jobs:
           mkdir -p "$HOME/.docker"
           AUTH="$(printf '%s:%s' "$REG_USER" "$REG_TOKEN" | base64 | tr -d '\n')"
           printf '{"auths":{"%s":{"auth":"%s"}}}\n' "$REGISTRY" "$AUTH" > "$HOME/.docker/config.json"
-          # helm keeps its own registry config; --plain-http talks HTTP to the registry.
-          printf '%s' "$REG_TOKEN" | helm registry login "$REGISTRY" --plain-http -u "$REG_USER" --password-stdin
+          # helm keeps its own registry config; HELM_PLAIN_HTTP is --plain-http only for
+          # a plain-HTTP registry, empty (dropped) for TLS.
+          printf '%s' "$REG_TOKEN" | helm registry login "$REGISTRY" ${HELM_PLAIN_HTTP} -u "$REG_USER" --password-stdin
 
-      - name: Create HTTP-scoped buildx builder (do NOT mutate the host daemon — probe A4)
-        # buildkitd config marks the HTTP registry http+insecure for THIS build only;
-        # no /etc/docker/daemon.json change, no host daemon restart.
+      - name: Create HTTP-scoped buildx builder (plain-HTTP registry only — do NOT mutate the host daemon — probe A4)
+        # Only needed when the configured OCI registry (vars.REGISTRY_HOST) is plain HTTP:
+        # buildkitd config marks that registry http+insecure for THIS build only; no
+        # /etc/docker/daemon.json change, no host daemon restart. Skipped for a TLS
+        # registry (the default builder is used instead).
+        if: env.REGISTRY_PLAIN_HTTP == 'true'
         run: |
-          cat > /tmp/buildkitd.toml <<'EOF'
-          [registry."10.0.0.110:3000"]
+          cat > /tmp/buildkitd.toml <<EOF
+          [registry."${REGISTRY}"]
             http = true
             insecure = true
           EOF
@@ -100,8 +127,10 @@ jobs:
 
       - name: Build + push image and record the digest (SC3 provenance)
         # --metadata-file is the authoritative digest source: `imagetools inspect`
-        # (below) is not guaranteed over the plain-HTTP registry, so the pinnable
-        # digest for the SC3 citation is read from the build metadata.
+        # (below) is not guaranteed over a plain-HTTP registry, so the pinnable
+        # digest for the SC3 citation is read from the build metadata. Uses whichever
+        # builder is active — the scoped HTTP builder above for a plain-HTTP registry,
+        # or the default builder for a TLS registry.
         run: |
           docker buildx build --push \
             --metadata-file /tmp/build-meta.json \
@@ -114,7 +143,7 @@ jobs:
 
       - name: Emit image digest via imagetools inspect (SC3 citation; best-effort over HTTP)
         # Kept for the SC3 pin as the research Pattern-1 citation; allowed to no-op if
-        # imagetools cannot negotiate the plain-HTTP registry — the digest above stands.
+        # imagetools cannot negotiate a plain-HTTP registry — the digest above stands.
         run: |
           docker buildx imagetools inspect "${IMAGE}:${VERSION}" \
             --format '{{println .Manifest.Digest}}' || \
@@ -124,11 +153,11 @@ jobs:
         # --version/--app-version override Chart.yaml's 0.1.0 at package time only:
         # no tracked-file mutation, no release commit, no drift. `helm push` infers the
         # chart name (aegis) and tag (chart version) from the .tgz, so the OCI ref has
-        # no trailing name.
+        # no trailing name. HELM_PLAIN_HTTP is --plain-http only for a plain-HTTP registry.
         run: |
           helm package helm/aegis --version "${VERSION}" --app-version "${VERSION}"
-          helm push "aegis-${VERSION}.tgz" "${CHART_REPO}" --plain-http
+          helm push "aegis-${VERSION}.tgz" "${CHART_REPO}" ${HELM_PLAIN_HTTP}
 
       - name: Remove the scoped buildx builder
-        if: always()
+        if: always() && env.REGISTRY_PLAIN_HTTP == 'true'
         run: docker buildx rm aegis-release || true

@@ -1,7 +1,7 @@
 image:
   # Local-dev defaults. A RELEASED install (OSS-02 SC3) overrides these to pin the
   # published artifact from the Forgejo OCI registry (D-04), e.g.:
-  #   --set image.repository=10.0.0.110:3000/rhinom/aegis \
+  #   --set image.repository=<your-registry>/<namespace>/aegis \
   #   --set image.tag=<VERSION>            # the git tag == image tag == chart version (D-07)
   # For immutable provenance, pin the digest instead of the tag:
   #   --set image.tag=<VERSION>@sha256:<DIGEST>   (digest emitted by release.yml)
