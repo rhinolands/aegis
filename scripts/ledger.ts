@@ -18,6 +18,8 @@
 // construction (mirrors join-aegis-audit.sh's tenant-predicate discipline):
 // the correlation id is the mandatory filter, --tenant/--verdict further scope it.
 
+import { realpathSync } from 'node:fs';
+import { pathToFileURL } from 'node:url';
 import { and, asc, eq, sql } from 'drizzle-orm';
 import { loadConfig } from '../src/config.js';
 import { getDb } from '../src/db/client.js';
@@ -161,7 +163,15 @@ async function main(): Promise<void> {
   }
 }
 
-main().catch((err) => {
-  console.error('ledger failed:', (err as Error).message);
-  process.exit(1);
-});
+// Run the CLI only when executed directly, not when imported (e.g. by the unit
+// test importing formatRow) — importing must not open a DB connection.
+const invokedDirectly =
+  !!process.argv[1] &&
+  import.meta.url === pathToFileURL(realpathSync(process.argv[1])).href;
+
+if (invokedDirectly) {
+  main().catch((err) => {
+    console.error('ledger failed:', (err as Error).message);
+    process.exit(1);
+  });
+}
