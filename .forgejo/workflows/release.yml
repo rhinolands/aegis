@@ -72,7 +72,12 @@ jobs:
         run: |
           echo "VERSION=${GITHUB_REF_NAME#v}" >> "$GITHUB_ENV"
           echo "IMAGE=${REGISTRY}/${REGISTRY_NAMESPACE}/aegis" >> "$GITHUB_ENV"
-          echo "CHART_REPO=oci://${REGISTRY}/${REGISTRY_NAMESPACE}" >> "$GITHUB_ENV"
+          # Chart goes under a DISTINCT OCI path (…/charts/aegis) — it MUST NOT share the
+          # image's repo path: helm push infers the chart name (aegis) from the .tgz, so
+          # oci://…/rhinom would push to rhinom/aegis:<ver> and collide with the image tag
+          # (last push wins → the tag flips to the chart, orphaning the image). Verified
+          # collision on run 9457; …/charts keeps image and chart cleanly separate.
+          echo "CHART_REPO=oci://${REGISTRY}/${REGISTRY_NAMESPACE}/charts" >> "$GITHUB_ENV"
           if [ "${REGISTRY_PLAIN_HTTP}" = "true" ]; then
             echo "HELM_PLAIN_HTTP=--plain-http" >> "$GITHUB_ENV"
           else
