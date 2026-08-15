@@ -389,7 +389,7 @@ export function registerLlmRawPlane(app: FastifyInstance, deps: ServerDeps): voi
     // upstream's own answer, which is what this route exists to deliver.
     // ---------------------------------------------------------------------
     if ((body as { stream?: unknown }).stream === true && upstream.ok && upstream.body !== null && upstreamIsEventStream) {
-      const usage: StreamUsage = { input: 0, output: 0, cacheWrite: 0, cacheRead: 0 };
+      const usage: StreamUsage = { input: 0, output: 0, cacheWrite: 0, cacheRead: 0, cacheWrite1h: 0 };
 
       // SINGLE-SHOT SETTLE. A client abort racing the pipeline's rejection would
       // otherwise meter the same turn twice. The promise is assigned before the
@@ -410,7 +410,7 @@ export function registerLlmRawPlane(app: FastifyInstance, deps: ServerDeps): voi
           // against roughly $0.75 of real spend. On a passthrough route that
           // forwards the caller's body verbatim and validates nothing but
           // `model`, any authenticated caller can produce that shape.
-          const { costMicros, priced } = priceMicros(model, usage.input, usage.output, usage.cacheWrite, usage.cacheRead);
+          const { costMicros, priced } = priceMicros(model, usage.input, usage.output, usage.cacheWrite, usage.cacheRead, usage.cacheWrite1h);
           if (!priced) {
             log.error(
               { model, agentId: principal.agentId },
@@ -425,10 +425,12 @@ export function registerLlmRawPlane(app: FastifyInstance, deps: ServerDeps): voi
           // closed tab all settle (RESEARCH Pitfall 9: closing the tab must not
           // be a way to get free tokens).
           const res = await governSettle(govDeps, ctx, decision, {
-            // The TOKEN cap counts all four classes too, for the same reason the
+            // The TOKEN cap counts all five classes too, for the same reason the
             // cost cap does: a cap that ignores the classes a caller can inflate
-            // at will is not a cap.
-            tokens: usage.input + usage.output + usage.cacheWrite + usage.cacheRead,
+            // at will is not a cap. cacheWrite1h is included so a 1h write is not
+            // silently dropped from the token count (when the breakdown is
+            // present cacheWrite+cacheWrite1h sum to the old flat total — DEBT-05).
+            tokens: usage.input + usage.output + usage.cacheWrite + usage.cacheWrite1h + usage.cacheRead,
             costMicros,
             error,
           });
@@ -537,8 +539,8 @@ export function registerLlmRawPlane(app: FastifyInstance, deps: ServerDeps): voi
     // slightly, it misses almost all of it (CR-02). This branch was worse than
     // the streaming one before plan 45-12: extractUsage did not even READ the
     // cache fields.
-    const { input, output, cacheWrite, cacheRead } = extractUsage('anthropic', parsed);
-    const { costMicros, priced } = priceMicros(model, input, output, cacheWrite, cacheRead);
+    const { input, output, cacheWrite, cacheRead, cacheWrite1h } = extractUsage('anthropic', parsed);
+    const { costMicros, priced } = priceMicros(model, input, output, cacheWrite, cacheRead, cacheWrite1h);
     if (!priced) {
       // Error level, not debug and not a silent zero — same signal the
       // envelope plane emits. A model that policy allowlisted but the price
@@ -551,7 +553,7 @@ export function registerLlmRawPlane(app: FastifyInstance, deps: ServerDeps): voi
     }
 
     const settled = await governSettle(govDeps, ctx, decision, {
-      tokens: input + output + cacheWrite + cacheRead,
+      tokens: input + output + cacheWrite + cacheWrite1h + cacheRead,
       costMicros,
     });
     if (!settled.ok) return reply.code(settled.status).send(settled.body);

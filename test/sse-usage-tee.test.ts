@@ -23,7 +23,7 @@ function frame(event: string, data: unknown): string {
  * which would silently defeat the whole point of the split tests below.
  */
 async function run(chunks: Buffer[]): Promise<{ out: Buffer; usage: StreamUsage }> {
-  let usage: StreamUsage = { input: 0, output: 0, cacheWrite: 0, cacheRead: 0 };
+  let usage: StreamUsage = { input: 0, output: 0, cacheWrite: 0, cacheRead: 0, cacheWrite1h: 0 };
   const tee = makeUsageTee((u) => { usage = u; });
   const out: Buffer[] = [];
   tee.on('data', (c: Buffer) => out.push(Buffer.from(c)));
@@ -95,6 +95,46 @@ describe('makeUsageTee', () => {
 
     expect(usage.cacheWrite).toBe(0);
     expect(usage.cacheRead).toBe(0);
+    expect(usage.cacheWrite1h).toBe(0);
+  });
+
+  it('splits the message_start cache_creation breakdown into 5m and 1h classes (DEBT-05)', async () => {
+    // The per-TTL breakdown must route ephemeral_5m -> cacheWrite (1.25x) and
+    // ephemeral_1h -> cacheWrite1h (2x) so the settle site prices the 1h write at
+    // its own rate. Before DEBT-05 the tee never read ephemeral_1h, so this would
+    // have left cacheWrite1h at 0 (and folded nothing distinct into the meter).
+    const sse = frame('message_start', {
+      type: 'message_start',
+      message: {
+        usage: {
+          input_tokens: 100,
+          cache_creation: { ephemeral_5m_input_tokens: 30000, ephemeral_1h_input_tokens: 70000 },
+          cache_creation_input_tokens: 100000,
+          cache_read_input_tokens: 9,
+        },
+      },
+    }) + frame('message_stop', { type: 'message_stop' });
+
+    const { usage } = await run([Buffer.from(sse, 'utf8')]);
+
+    expect(usage.cacheWrite).toBe(30000);
+    expect(usage.cacheWrite1h).toBe(70000);
+    expect(usage.cacheRead).toBe(9);
+    // The flat sum is NOT double-counted on top of the split.
+    expect(usage.cacheWrite + usage.cacheWrite1h).toBe(100000);
+  });
+
+  it('treats a flat cache_creation_input_tokens as a 5m write with no 1h component', async () => {
+    // Byte-identical to pre-DEBT-05 behaviour for upstreams that emit no split.
+    const sse = frame('message_start', {
+      type: 'message_start',
+      message: { usage: { input_tokens: 100, cache_creation_input_tokens: 7, cache_read_input_tokens: 9 } },
+    }) + frame('message_stop', { type: 'message_stop' });
+
+    const { usage } = await run([Buffer.from(sse, 'utf8')]);
+
+    expect(usage.cacheWrite).toBe(7);
+    expect(usage.cacheWrite1h).toBe(0);
   });
 
   it('reassembles a frame split across two chunks mid-line, with identical bytes AND identical usage', async () => {

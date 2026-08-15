@@ -53,6 +53,13 @@ export interface StreamUsage {
   output: number;
   cacheWrite: number;
   cacheRead: number;
+  // The ONE-HOUR cache write, a distinct billed class from the 5-minute
+  // `cacheWrite` (2x base input vs 1.25x). Anthropic reports the per-TTL split
+  // in `usage.cache_creation.{ephemeral_5m,ephemeral_1h}_input_tokens`; the flat
+  // top-level `cache_creation_input_tokens` is their sum. Kept separate here so
+  // the settle site can price it at its own rate (DEBT-05) rather than folding a
+  // 1h write into the 5m rate and under-metering it 1.6x.
+  cacheWrite1h: number;
 }
 
 // Coerce every usage field before arithmetic. Carried verbatim in intent from
@@ -109,7 +116,7 @@ const n = (v: unknown): number => {
  * usage instead of zero (45-RESEARCH.md Pitfall 9).
  */
 export function makeUsageTee(onUsage: (usage: StreamUsage) => void): Transform {
-  const usage: StreamUsage = { input: 0, output: 0, cacheWrite: 0, cacheRead: 0 };
+  const usage: StreamUsage = { input: 0, output: 0, cacheWrite: 0, cacheRead: 0, cacheWrite1h: 0 };
 
   // A streaming TextDecoder: decode(chunk, { stream: true }) holds back the
   // bytes of an incomplete multi-byte sequence and prepends them to the next
@@ -124,7 +131,10 @@ export function makeUsageTee(onUsage: (usage: StreamUsage) => void): Transform {
 
   /**
    * Usage rules, mirroring the SDK's own accumulator exactly:
-   *   message_start -> usage.input_tokens (+ the two cache counters)
+   *   message_start -> usage.input_tokens (+ the cache counters: 5m write, 1h
+   *                    write and read; the 5m/1h split comes from the
+   *                    cache_creation breakdown when present, else the flat
+   *                    cache_creation_input_tokens is a 5m write — DEBT-05)
    *   message_delta -> usage.output_tokens, which is CUMULATIVE and therefore
    *                    OVERWRITES rather than accumulates. Three deltas
    *                    reporting 500, 1200 and 2000 mean the turn produced
@@ -139,17 +149,28 @@ export function makeUsageTee(onUsage: (usage: StreamUsage) => void): Transform {
     if (type === 'message_start') {
       const message = d?.message as { usage?: Record<string, unknown> } | undefined;
       const u = message?.usage ?? {};
+      const cc = u.cache_creation as Record<string, unknown> | null | undefined;
       usage.input = n(u.input_tokens);
-      usage.cacheWrite = n(u.cache_creation_input_tokens);
+      // Prefer the per-TTL breakdown: ephemeral_5m -> cacheWrite (1.25x),
+      // ephemeral_1h -> cacheWrite1h (2x). When no breakdown is present the flat
+      // count is the only signal and is metered as a 5m write — byte-identical to
+      // the pre-DEBT-05 behaviour for upstreams that do not emit the split.
+      usage.cacheWrite = cc ? n(cc.ephemeral_5m_input_tokens) : n(u.cache_creation_input_tokens);
+      usage.cacheWrite1h = cc ? n(cc.ephemeral_1h_input_tokens) : 0;
       usage.cacheRead = n(u.cache_read_input_tokens);
       onUsage({ ...usage });
       return;
     }
     if (type === 'message_delta') {
       const u = (d?.usage as Record<string, unknown> | undefined) ?? {};
+      const cc = u.cache_creation as Record<string, unknown> | null | undefined;
       if (u.output_tokens != null) usage.output = n(u.output_tokens);
       if (u.input_tokens != null) usage.input = n(u.input_tokens);
-      if (u.cache_creation_input_tokens != null) usage.cacheWrite = n(u.cache_creation_input_tokens);
+      // Breakdown wins when present; otherwise the flat field still overwrites
+      // cacheWrite as a 5m write (the delta's cumulative-overwrite semantics).
+      if (cc && cc.ephemeral_5m_input_tokens != null) usage.cacheWrite = n(cc.ephemeral_5m_input_tokens);
+      else if (u.cache_creation_input_tokens != null) usage.cacheWrite = n(u.cache_creation_input_tokens);
+      if (cc && cc.ephemeral_1h_input_tokens != null) usage.cacheWrite1h = n(cc.ephemeral_1h_input_tokens);
       if (u.cache_read_input_tokens != null) usage.cacheRead = n(u.cache_read_input_tokens);
       onUsage({ ...usage });
     }
