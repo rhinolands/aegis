@@ -15,9 +15,11 @@
 #     has NO /etc/docker/daemon.json insecure-registries. So the HTTP allowance is
 #     scoped to a dedicated buildx builder (buildkitd config) rather than mutating the
 #     host daemon, and helm uses its native --plain-http flag.
-#   - Auth is the CI secret FORGEJO_REGISTRY_TOKEN (scope write:package). The user
-#     `rhinom` is public and hardcoded. The token embedded in the git-remote URL is
-#     NEVER used for registry auth and never referenced here (T-49-04-01).
+#   - Auth is the built-in Forgejo Actions token (github.token, auto-injected per run,
+#     scoped by `permissions: packages: write`) as the pushing actor (github.actor).
+#     No CI secret to create, no personal/shared token stored (Forgejo 14.0.3 supports
+#     the auto token pushing to its own package registry). The token embedded in the
+#     git-remote URL is NEVER used for registry auth and never referenced here (T-49-04-01).
 #
 # This authors the pipeline only. The LIVE tagged-release run (real publication,
 # danger-zone, operator/money-gated) is plan 49-06.
@@ -32,6 +34,9 @@ on:
 jobs:
   release:
     runs-on: ct102
+    permissions:
+      contents: read
+      packages: write
     env:
       REGISTRY: 10.0.0.110:3000
       IMAGE: 10.0.0.110:3000/rhinom/aegis
@@ -62,20 +67,24 @@ jobs:
           echo "$HOME/bin" >> "$GITHUB_PATH"
           "$HOME/bin/helm" version
 
-      - name: Registry auth (CI secret only — token piped, never echoed; user `rhinom` is public)
+      - name: Registry auth (built-in Actions token — piped, never echoed)
         # HTTP registry (probe A4): docker login would fail the HTTPS->HTTP handshake
         # because the host daemon has no insecure-registries. So the buildkit builder
         # (created below) reads credentials straight from ~/.docker/config.json — no
         # `docker login` network handshake needed. helm gets its own --plain-http login.
+        # Auth = the auto-injected Forgejo Actions token (github.token) as the pushing
+        # actor (github.actor); scoped by the job `permissions: packages: write`. No CI
+        # secret to create, no personal/shared token stored (Forgejo 14.0.3 supports it).
         env:
-          REG_TOKEN: ${{ secrets.FORGEJO_REGISTRY_TOKEN }}
+          REG_USER: ${{ github.actor }}
+          REG_TOKEN: ${{ github.token }}
         run: |
           umask 077
           mkdir -p "$HOME/.docker"
-          AUTH="$(printf '%s:%s' 'rhinom' "$REG_TOKEN" | base64 | tr -d '\n')"
+          AUTH="$(printf '%s:%s' "$REG_USER" "$REG_TOKEN" | base64 | tr -d '\n')"
           printf '{"auths":{"%s":{"auth":"%s"}}}\n' "$REGISTRY" "$AUTH" > "$HOME/.docker/config.json"
           # helm keeps its own registry config; --plain-http talks HTTP to the registry.
-          printf '%s' "$REG_TOKEN" | helm registry login "$REGISTRY" --plain-http -u 'rhinom' --password-stdin
+          printf '%s' "$REG_TOKEN" | helm registry login "$REGISTRY" --plain-http -u "$REG_USER" --password-stdin
 
       - name: Create HTTP-scoped buildx builder (do NOT mutate the host daemon — probe A4)
         # buildkitd config marks the HTTP registry http+insecure for THIS build only;
