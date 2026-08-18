@@ -40,6 +40,17 @@ fail() {
   exit 1
 }
 
+# Presenter mode: pause between beats for a narrated or recorded walkthrough.
+#   PAUSE=1  wait for Enter, showing a dim "[ Enter ]" hint (good for practice)
+#   PAUSE=2  wait for Enter SILENTLY (clean frozen frame for on-screen captions)
+# CI-safe: with no attached terminal (pipe/CI) it never blocks.
+pause() {
+  case "${PAUSE:-0}" in 1|2) ;; *) return 0 ;; esac
+  [ -t 0 ] || return 0
+  [ "${PAUSE}" = "1" ] && printf '\n%s    [ Enter for the next step ]%s ' "$DIM" "$RESET"
+  read -r _ || true
+}
+
 # ---------------------------------------------------------------------------
 # Config (all overridable; sane dev defaults so the script needs no args)
 # ---------------------------------------------------------------------------
@@ -200,6 +211,7 @@ section "Resetting to a clean chain"
 psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -q -c 'TRUNCATE audit_records, chain_head;'
 info "audit_records + chain_head truncated — every record below is new"
 pass "clean chain"
+pause  # presenter: start recording here, then Enter to begin beat 1
 
 # ---------------------------------------------------------------------------
 # Step 1: register an agent with exactly one allowlisted tool
@@ -225,6 +237,7 @@ console.log(JSON.stringify({
 '
 info "api key issued: ${API_KEY:0:14}... (never logged in full; register.ts prints it exactly once)"
 pass "agent registered — it can call '${TOOL}' and nothing else"
+pause
 
 # ---------------------------------------------------------------------------
 # Step 2: ALLOWED tool call
@@ -245,6 +258,7 @@ pass "200 — the upstream saw authSeen:true: the gateway injected the scoped ba
 
 print_record "audit record for this call (who / what / why / verdict):"
 pass "allow logged"
+pause
 
 # ---------------------------------------------------------------------------
 # Step 3: UNAUTHORIZED tool call (tool not on the allowlist)
@@ -263,6 +277,7 @@ pass "403 — denied fail-closed by policy (tool not in the agent's allowlist)"
 
 print_record "DENY record for this call — the deny log IS the product (who / what / why / verdict):"
 pass "deny logged"
+pause
 
 # ---------------------------------------------------------------------------
 # Step 4: chain verification — must PASS
@@ -282,6 +297,7 @@ echo "    $VERIFY_1"
 printf '%s' "$VERIFY_1" | grep -q '"ok":true' \
   || fail "expected verifyChain to PASS on an untampered chain, got: $VERIFY_1"
 pass "chain verified — 2 records (1 allow, 1 deny), hashes match"
+pause  # dramatic beat: pressing Enter reveals the tamper attack
 
 # ---------------------------------------------------------------------------
 # Step 5: tamper as an attacker with owner DB credentials would, then re-verify
