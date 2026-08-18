@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# scripts/demo.sh — the five-minute end-to-end demo for aegis (spec §5.10).
+# scripts/demo.sh. the five-minute end-to-end demo for aegis (spec §5.10).
 #
 # Narrative, in order:
 #   1. Register an agent with exactly one allowlisted tool ("echo").
@@ -14,7 +14,7 @@
 # Self-contained: starts the echo upstream and the gateway itself if they are
 # not already running, waits for readiness (no blind sleeps), and stops only
 # what it started on exit. Fails loudly (non-zero exit, clear message) the
-# instant any step doesn't produce the expected outcome — a demo that prints
+# instant any step doesn't produce the expected outcome. a demo that prints
 # success regardless of what happened is worthless.
 set -euo pipefail
 
@@ -92,14 +92,14 @@ cleanup() {
     wait "$SERVER_PID" 2>/dev/null || true
     info "stopped gateway we started (pid $SERVER_PID)"
   else
-    info "gateway was already running externally; left it running"
+    info "gateway was already running externally. left it running"
   fi
   if [ "$STARTED_ECHO" = "1" ] && [ -n "$ECHO_PID" ]; then
     kill "$ECHO_PID" 2>/dev/null || true
     wait "$ECHO_PID" 2>/dev/null || true
     info "stopped echo upstream we started (pid $ECHO_PID)"
   else
-    info "echo upstream was already running externally; left it running"
+    info "echo upstream was already running externally. left it running"
   fi
   rm -rf "$TMP_DIR"
   exit "$ec"
@@ -176,7 +176,7 @@ fi
 # ---------------------------------------------------------------------------
 section "Starting services"
 if wait_for_http "$UPSTREAM_URL" "echo upstream" 1; then
-  info "echo upstream already running at $UPSTREAM_URL — reusing it"
+  info "echo upstream already running at $UPSTREAM_URL. reusing it"
 else
   ECHO_PORT="$ECHO_PORT" node scripts/echo-upstream.mjs > "$ECHO_LOG" 2>&1 &
   ECHO_PID=$!
@@ -192,7 +192,7 @@ fi
 # Start the gateway itself (skip if something already answers /health)
 # ---------------------------------------------------------------------------
 if wait_for_http "$BASE/health" "gateway" 1; then
-  info "gateway already running at $BASE — reusing it"
+  info "gateway already running at $BASE. reusing it"
 else
   node dist/index.js > "$GATEWAY_LOG" 2>&1 &
   SERVER_PID=$!
@@ -209,14 +209,14 @@ fi
 # ---------------------------------------------------------------------------
 section "Resetting to a clean chain"
 psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -q -c 'TRUNCATE audit_records, chain_head;'
-info "audit_records + chain_head truncated — every record below is new"
+info "audit_records + chain_head truncated. every record below is new"
 pass "clean chain"
 pause  # presenter: start recording here, then Enter to begin beat 1
 
 # ---------------------------------------------------------------------------
 # Step 1: register an agent with exactly one allowlisted tool
 # ---------------------------------------------------------------------------
-section "1. Register agent '${AGENT_NAME}' — allowlisted tool: '${TOOL}' only"
+section "1. Register agent '${AGENT_NAME}'. allowlisted tool: '${TOOL}' only"
 REGISTER_OUT=$(npx tsx scripts/register.ts \
   --name "$AGENT_NAME" --tenant "$TENANT" \
   --tool "$TOOL" \
@@ -235,8 +235,8 @@ console.log(JSON.stringify({
   upstreamUrl: o.credential.upstreamUrl,
 }, null, 2));
 '
-info "api key issued: ${API_KEY:0:14}... (never logged in full; register.ts prints it exactly once)"
-pass "agent registered — it can call '${TOOL}' and nothing else"
+info "api key issued: ${API_KEY:0:14}... (never logged in full. register.ts prints it exactly once)"
+pass "agent registered. it can call '${TOOL}' and nothing else"
 pause
 
 # ---------------------------------------------------------------------------
@@ -253,8 +253,8 @@ pretty_json_file "$TMP_DIR/allowed.json" | sed 's/^/    /'
 
 [ "$ALLOW_CODE" = "200" ] || fail "expected 200 for the allowed tool call, got $ALLOW_CODE"
 grep -q '"authSeen":true' "$TMP_DIR/allowed.json" \
-  || fail "upstream did not see an Authorization header — credential injection did not happen"
-pass "200 — the upstream saw authSeen:true: the gateway injected the scoped backend credential; the caller only ever held its own x-api-key"
+  || fail "upstream did not see an Authorization header. credential injection did not happen"
+pass "200. the upstream saw authSeen:true: the gateway injected the scoped backend credential. the caller only ever held its own x-api-key"
 
 print_record "audit record for this call (who / what / why / verdict):"
 pass "allow logged"
@@ -272,15 +272,15 @@ DENY_CODE=$(curl -s -o "$TMP_DIR/denied.json" -w '%{http_code}' \
 echo "    HTTP $DENY_CODE"
 pretty_json_file "$TMP_DIR/denied.json" | sed 's/^/    /'
 
-[ "$DENY_CODE" = "403" ] || fail "expected 403 for the unauthorized tool call, got $DENY_CODE — this is the whole product; a non-403 here is a governance failure, not a demo quirk"
-pass "403 — denied fail-closed by policy (tool not in the agent's allowlist)"
+[ "$DENY_CODE" = "403" ] || fail "expected 403 for the unauthorized tool call, got $DENY_CODE. this is the whole product. a non-403 here is a governance failure, not a demo quirk"
+pass "403. denied fail-closed by policy (tool not in the agent's allowlist)"
 
-print_record "DENY record for this call — the deny log IS the product (who / what / why / verdict):"
+print_record "DENY record for this call. the deny log IS the product (who / what / why / verdict):"
 pass "deny logged"
 pause
 
 # ---------------------------------------------------------------------------
-# Step 4: chain verification — must PASS
+# Step 4: chain verification. must PASS
 # ---------------------------------------------------------------------------
 section "4. Chain verification (expect PASS)"
 VERIFY_1=$(node --input-type=module -e '
@@ -296,7 +296,7 @@ await sql.end();
 echo "    $VERIFY_1"
 printf '%s' "$VERIFY_1" | grep -q '"ok":true' \
   || fail "expected verifyChain to PASS on an untampered chain, got: $VERIFY_1"
-pass "chain verified — 2 records (1 allow, 1 deny), hashes match"
+pass "chain verified. 2 records (1 allow, 1 deny), hashes match"
 pause  # dramatic beat: pressing Enter reveals the tamper attack
 
 # ---------------------------------------------------------------------------
@@ -332,8 +332,8 @@ await sql.end();
 echo "    $VERIFY_2"
 printf '%s' "$VERIFY_2" | grep -q '"ok":false' \
   && printf '%s' "$VERIFY_2" | grep -q 'hash mismatch' \
-  || fail "expected verifyChain to FAIL with a hash mismatch after tampering, got: $VERIFY_2 — this means a tampered record would go UNDETECTED"
-pass "chain verification correctly FAILED — the tampered record was caught"
+  || fail "expected verifyChain to FAIL with a hash mismatch after tampering, got: $VERIFY_2. this means a tampered record would go UNDETECTED"
+pass "chain verification correctly FAILED. the tampered record was caught"
 
 # ---------------------------------------------------------------------------
 # Done
