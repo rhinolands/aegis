@@ -31,6 +31,14 @@ else
   BOLD=''; DIM=''; RED=''; GREEN=''; YELLOW=''; CYAN=''; RESET=''
 fi
 
+# Reveal pacing: with REVEAL_DELAY set (seconds), print stdin one line at a time
+# with a small sleep so a block does not snap in all at once. Default 0 = off (CI-safe).
+REVEAL_DELAY="${REVEAL_DELAY:-0}"
+reveal() {
+  if [ "$REVEAL_DELAY" = "0" ]; then cat; return; fi
+  while IFS= read -r _line; do printf '%s\n' "$_line"; sleep "$REVEAL_DELAY"; done
+}
+
 section() { printf '\n%s%s=== %s ===%s\n' "$BOLD" "$CYAN" "$1" "$RESET"; }
 info()    { printf '%s    %s%s\n' "$DIM" "$1" "$RESET"; }
 pass()    { printf '%s    OK: %s%s\n' "$GREEN" "$1" "$RESET"; }
@@ -133,15 +141,21 @@ print_record() {
            why->>'reason'                  AS why_reason
     FROM audit_records
     WHERE seq = (SELECT max(seq) FROM audit_records);
-  "
+  " | reveal
 }
 
 pretty_json_file() {
-  node -e 'const fs=require("fs");console.log(JSON.stringify(JSON.parse(fs.readFileSync(process.argv[1],"utf8")),null,2))' "$1" \
-    2>/dev/null || cat "$1"
+  { node -e 'const fs=require("fs");console.log(JSON.stringify(JSON.parse(fs.readFileSync(process.argv[1],"utf8")),null,2))' "$1" \
+    2>/dev/null || cat "$1"; } | reveal
 }
 
 SECONDS=0
+
+# ---------------------------------------------------------------------------
+# Live banner: proves this ran just now, not a canned recording.
+# ---------------------------------------------------------------------------
+section "aegis live demo"
+info "$(date '+%Y-%m-%d %H:%M %Z')"
 
 # ---------------------------------------------------------------------------
 # Preflight
@@ -314,7 +328,7 @@ UPDATE audit_records
  WHERE seq = (SELECT max(seq) FROM audit_records);
 ALTER TABLE audit_records ENABLE TRIGGER trg_audit_no_mutate;"
 printf '%s    the attacker holds owner DB credentials and runs this straight against Postgres:%s\n' "$DIM" "$RESET"
-printf '%s' "$YELLOW"; printf '%s\n' "$TAMPER_SQL" | sed 's/^/    /'; printf '%s' "$RESET"
+printf '%s' "$YELLOW"; printf '%s\n' "$TAMPER_SQL" | sed 's/^/    /' | reveal; printf '%s' "$RESET"
 psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -q -c "$TAMPER_SQL"
 AFTER=$(psql "$DATABASE_URL" -t -A -c "SELECT seq || '|' || verdict FROM audit_records WHERE seq = (SELECT max(seq) FROM audit_records);")
 info "target record after tamper:  seq|verdict = $AFTER (trigger disabled, edited, re-enabled)"
