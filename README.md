@@ -6,6 +6,12 @@ Apache-2.0. Self-hostable: one TypeScript service + Postgres.
 
 ![Aegis demo: an allowed call, a denied call, and a tampered audit record caught by the hash chain](docs/demo.gif)
 
+**Full run (with controls):**
+
+https://github.com/user-attachments/assets/62600322-78c9-4112-83fe-2cd4be6cddc4
+
+
+
 *Real execution, from register to caught tamper. An allowed call. A denied call. A tampered audit record caught by the hash chain. Run it yourself with `bash scripts/demo.sh`.*
 
 > **Status: v0.1 complete — 20 of 20 planned tasks.** The foundation, the audit spine, the policy engine, the guards, the govern pipeline, all three mediation planes (MCP, A2A, LLM), object-storage export, the Helm chart, the end-to-end demo script, and CI are all built and tested. See [What's actually built](#whats-actually-built) — that section is deliberately precise, because a governance tool that overstates its own guarantees is worse than none.
