@@ -5,3 +5,7 @@ dist
 policy.wasm
 coverage
 .superpowers/
+
+# Local demo recordings and rendered media (kept in Forgejo, never on public GitHub)
+demo-media/
+Kapture*.mp4
