@@ -21,6 +21,10 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT_DIR"
 
+# Keep the on-screen output clean: silence Node's loader deprecation notices
+# (from the tsx register hook, not from aegis) so the demo shows only its own output.
+export NODE_NO_WARNINGS=1
+
 # ---------------------------------------------------------------------------
 # Presentation helpers
 # ---------------------------------------------------------------------------
