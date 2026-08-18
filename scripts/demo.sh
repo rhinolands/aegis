@@ -306,13 +306,16 @@ section "5. Tamper with a record (owner-DB-credentials attack), then re-verify (
 BEFORE=$(psql "$DATABASE_URL" -t -A -c "SELECT seq || '|' || verdict FROM audit_records WHERE seq = (SELECT max(seq) FROM audit_records);")
 info "target record before tamper: seq|verdict = $BEFORE"
 
-psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -q -c "
-  ALTER TABLE audit_records DISABLE TRIGGER trg_audit_no_mutate;
-  UPDATE audit_records
-     SET verdict = CASE WHEN verdict = 'allow' THEN 'deny' ELSE 'allow' END
-   WHERE seq = (SELECT max(seq) FROM audit_records);
-  ALTER TABLE audit_records ENABLE TRIGGER trg_audit_no_mutate;
-"
+# Show the attack on screen: the exact SQL an attacker with owner DB
+# credentials runs. Seeing the crime is the whole point of this beat.
+TAMPER_SQL="ALTER TABLE audit_records DISABLE TRIGGER trg_audit_no_mutate;
+UPDATE audit_records
+   SET verdict = CASE WHEN verdict = 'allow' THEN 'deny' ELSE 'allow' END
+ WHERE seq = (SELECT max(seq) FROM audit_records);
+ALTER TABLE audit_records ENABLE TRIGGER trg_audit_no_mutate;"
+printf '%s    the attacker holds owner DB credentials and runs this straight against Postgres:%s\n' "$DIM" "$RESET"
+printf '%s' "$YELLOW"; printf '%s\n' "$TAMPER_SQL" | sed 's/^/    /'; printf '%s' "$RESET"
+psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -q -c "$TAMPER_SQL"
 AFTER=$(psql "$DATABASE_URL" -t -A -c "SELECT seq || '|' || verdict FROM audit_records WHERE seq = (SELECT max(seq) FROM audit_records);")
 info "target record after tamper:  seq|verdict = $AFTER (trigger disabled, edited, re-enabled)"
 
