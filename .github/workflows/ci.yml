@@ -38,17 +38,18 @@ jobs:
       - uses: actions/checkout@v4
 
       # GitHub Actions `services:` containers cannot override the image
-      # command, and the official minio/minio image requires `server /data`
-      # as its command — so it can't be used as a plain services: entry.
-      # (bitnami/minio:latest, which could, no longer exists on Docker Hub —
-      # that's what broke the first CI run.) Run it as a normal step instead.
+      # command, and the MinIO image requires `server /data` as its command,
+      # so it can't be used as a plain services: entry. Run it as a step.
+      # Registry note: the Docker Hub images have both been pulled from under us
+      # in turn (bitnami/minio removed, then minio/minio access-denied). Pull
+      # from MinIO's own registry quay.io/minio/minio, which stays public.
       - name: start MinIO
         run: |
           docker run -d --name minio \
             -p 9000:9000 \
             -e MINIO_ROOT_USER=aegis \
             -e MINIO_ROOT_PASSWORD=aegis12345 \
-            minio/minio server /data
+            quay.io/minio/minio:latest server /data
 
           echo "waiting for MinIO to become healthy..."
           for i in $(seq 1 30); do
