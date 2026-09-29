@@ -25,9 +25,13 @@ config:
 database:
   url: ""        # postgres://... — set via --set or a sealed secret, never committed
 
-# Object-store target for audit export. Swap MinIO (k3s default) for S3, Azure
-# Blob (S3-compatible gateway), or GCS (S3 interoperability endpoint) purely by
-# changing endpoint/region + the access/secret keys below — no code change.
+# Object-store target for audit export. The chart does not deploy a store: point
+# it at any S3-compatible endpoint (an in-namespace store such as SeaweedFS, or
+# S3, Azure Blob via an S3-compatible gateway, GCS via its S3 interoperability
+# endpoint) by changing endpoint/region + the access/secret keys below. No code
+# change. The default keeps the historical in-namespace service name `minio`.
+# MinIO images are no longer anonymously pullable (2026-09), so new installs
+# should run another store under that service name or override the endpoint.
 objectStore:
   endpoint: "http://minio:9000"
   bucket: "aegis-audit"

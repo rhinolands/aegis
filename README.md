@@ -105,7 +105,7 @@ For all three planes the upstream destination is **operator-configured, never ca
 
 - **Object-storage export** — daily JSONL segments + sha256 manifest + chain-head pointer, written to any S3-compatible store (MinIO, S3, Azure Blob, GCS via interop endpoint)
 - **Agent registration CLI** (`scripts/register.ts`) — the only way to create an agent identity, its tool/peer/model allowlist, and its scoped backend credential; returns the raw API key exactly once
-- **Helm chart** (`helm/aegis`) — k3s-first, single replica by design (see chart comments), pre-install migration Job, MinIO as the default object store
+- **Helm chart** (`helm/aegis`) — k3s-first, single replica by design (see chart comments), pre-install migration Job, bring-your-own S3-compatible object store
 - **`scripts/demo.sh`** — the five-minute end-to-end walkthrough (see [Demo](#demo) below)
 - **CI** — GitHub Actions (build, typecheck, `opa test`, Postgres + S3 (SeaweedFS) integration tests, gitleaks, CLA bot) and a Forgejo `workflow_dispatch` e2e job
 
@@ -199,9 +199,11 @@ helm install aegis ./helm/aegis \
 Nothing in `values.yaml` is a usable credential — secrets are placeholders,
 supplied at install time via `--set`, `--set-file`, a gitignored local values
 override, or a sealed-secrets/external-secrets pipeline. `objectStore.endpoint`
-defaults to `http://minio:9000`, matching a k3s cluster's in-namespace MinIO
-service name; swap it for S3, Azure Blob, or GCS by endpoint/region alone — no
-code change.
+defaults to `http://minio:9000`, an in-namespace service name. The chart does not
+deploy the store. MinIO images are no longer anonymously pullable, so for a new
+k3s install run another S3-compatible store (CI uses SeaweedFS, see the local test
+command above) under that service name, or point the endpoint at S3, Azure Blob,
+or GCS by endpoint/region alone. No code change.
 
 ## Demo
 
