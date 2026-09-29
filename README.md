@@ -4,7 +4,7 @@
 
 Apache-2.0. Self-hostable: one TypeScript service + Postgres.
 
-**Threat model:** [THREAT_MODEL.md](THREAT_MODEL.md) maps these controls to the OWASP LLM Top 10 and the agentic threat model, with explicit non-goals.
+**Threat model:** [THREAT_MODEL.md](THREAT_MODEL.md) maps these controls to the OWASP LLM Top 10, MITRE ATLAS and the agentic threat model, with explicit non-goals.
 
 https://github.com/user-attachments/assets/62600322-78c9-4112-83fe-2cd4be6cddc4
 

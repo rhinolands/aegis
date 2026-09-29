@@ -48,6 +48,30 @@ Coverage keys: **Primary** = a core control directly addresses it. **Containment
 | Context or memory poisoning | Containment | Aegis does not inspect context. Poisoned context that drives the agent toward an action still meets deny-by-default and the allowlists at the boundary. |
 | Cascading multi-agent failure | Containment | The peer allowlist and per-agent scope stop a compromised or malfunctioning agent from expanding its reach across the fleet. |
 
+## MITRE ATLAS mapping
+
+Technique IDs and names are from MITRE ATLAS v5.6.0 (`mitre-atlas/atlas-data`, verified 2026-09-29). Only techniques that touch the action boundary are listed. The coverage keys are the same as above.
+
+| ATLAS technique | Aegis coverage | How, or why not |
+|-----------------|----------------|-----------------|
+| AML.T0053 AI Agent Tool Invocation | Primary | Per-agent tool allowlist plus deny-by-default. A tool the agent was never granted cannot be invoked through the gateway. |
+| AML.T0083 Credentials from AI Agent Configuration | Primary | The agent's configuration holds only its own key. Backend credentials live in the gateway's scoped store and are injected only after policy allows the call. |
+| AML.T0055 Unsecured Credentials | Primary for backend credentials | Backend secrets are encrypted at rest, scoped by agent and target, and never placed in the agent's environment. Credentials outside the gateway are out of scope. |
+| AML.T0081 Modify AI Agent Configuration | Primary for authority | Allowlists, destinations and credentials are operator-registered on the gateway, not read from the agent's configuration. An agent that edits its own configuration does not gain authority. |
+| AML.T0034 Cost Harvesting | Primary | The guard (rate, quota, budget) runs before execution, and the LLM plane meters tokens and cost. An agent with no configured budget is denied. |
+| AML.T0034.002 Agentic Resource Consumption | Primary | Same guard and metering apply to tool and model calls, so a coerced agent hits its budget instead of an open bill. |
+| AML.T0086 Exfiltration via AI Agent Tool Invocation | Containment | Only allowlisted tools are reachable, and their destinations are resolved server-side, so the caller cannot redirect a call to a server it controls. Data encoded into the parameters of an allowed tool is not inspected. |
+| AML.T0101 Data Destruction via AI Agent Tool Invocation | Containment | Mutative tools are reachable only if explicitly allowlisted for that agent, and every call is recorded in the tamper-evident audit. Misuse of a granted tool is bounded, not prevented. |
+| AML.T0098 AI Agent Tool Credential Harvesting | Containment | Tool scope and on-behalf-of identity limit which data stores the agent can read. Credentials sitting inside data the agent may legitimately read are not detected. |
+| AML.T0057 LLM Data Leakage | Primary at the access boundary | The agent retrieves with the requesting user's authority, so it cannot fetch what that user could not. Aegis does not redact model output. |
+| AML.T0051 LLM Prompt Injection | Containment | Not detected. A hijacked agent still meets deny-by-default, its allowlists and a scoped credential. |
+| AML.T0054 LLM Jailbreak | Containment | Not detected. A jailbroken model can only request actions the agent was already granted. |
+| AML.T0080 AI Agent Context Poisoning | Containment | Context is not inspected. Actions driven by poisoned context still pass the same policy check. |
+| AML.T0029 Denial of AI Service | Containment | Per-agent rate limits stop one agent from flooding upstream models. Aegis is not a network-level DoS defense. |
+| AML.T0070 RAG Poisoning | Out of scope | Ingestion and retrieval integrity belong upstream. Actions a poisoned answer triggers are still bounded at the gateway. |
+| AML.T0110 AI Agent Tool Poisoning | Out of scope | Tool integrity is a supply-chain control. The gateway limits which tools and destinations are reachable, not what a tool's code does. |
+| AML.T0024 Exfiltration via AI Inference API | Out of scope | Model-level inference attacks on training data are a model and serving concern. |
+
 ## Non-goals (explicit boundaries)
 
 Aegis is not, and does not try to be:
