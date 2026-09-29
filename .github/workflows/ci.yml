@@ -25,8 +25,8 @@ jobs:
       # Throwaway all-zero base64 key for CI only — NOT a real secret. Real
       # keys come from GitHub Actions secrets / sealed secrets in deploys.
       AUDIT_MASTER_KEY: AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=
-      # RUN_S3_INTEGRATION=1 makes the MinIO export test a hard gate: if
-      # MinIO is unreachable when this is set, the test FAILS rather than
+      # RUN_S3_INTEGRATION=1 makes the S3 export test a hard gate: if the
+      # S3 store is unreachable when this is set, the test FAILS rather than
       # silently skipping (see test/audit-export.test.ts).
       RUN_S3_INTEGRATION: "1"
       EXPORT_S3_ENDPOINT: http://localhost:9000
@@ -37,35 +37,38 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # GitHub Actions `services:` containers cannot override the image
-      # command, and the MinIO image requires `server /data` as its command,
-      # so it can't be used as a plain services: entry. Run it as a step.
-      # Registry note: the Docker Hub images have both been pulled from under us
-      # in turn (bitnami/minio removed, then minio/minio access-denied). Pull
-      # from MinIO's own registry quay.io/minio/minio, which stays public.
-      - name: start MinIO
+      # S3-compatible store for the export integration test. MinIO images are
+      # no longer anonymously pullable from any registry (bitnami/minio removed,
+      # then minio/minio and quay.io/minio/minio both return unauthorized), so
+      # CI uses SeaweedFS (Apache-2.0, public Docker Hub image, pinned). The
+      # test only needs HeadBucket/CreateBucket/PutObject/GetObject with
+      # path-style addressing. The identity file enforces the same aegis
+      # credentials, so unsigned requests are rejected (403).
+      # Run as a step, not services:, because services: cannot set a command.
+      - name: start S3 store (SeaweedFS)
         run: |
-          docker run -d --name minio \
+          printf '{"identities":[{"name":"aegis","credentials":[{"accessKey":"aegis","secretKey":"aegis12345"}],"actions":["Admin","Read","Write","List","Tagging"]}]}' > "$RUNNER_TEMP/s3.json"
+          docker run -d --name s3 \
             -p 9000:9000 \
-            -e MINIO_ROOT_USER=aegis \
-            -e MINIO_ROOT_PASSWORD=aegis12345 \
-            quay.io/minio/minio:latest server /data
+            -v "$RUNNER_TEMP/s3.json:/etc/seaweedfs/s3.json:ro" \
+            chrislusf/seaweedfs:4.48 \
+            server -dir=/data -s3 -s3.port=9000 -s3.config=/etc/seaweedfs/s3.json
 
-          echo "waiting for MinIO to become healthy..."
+          echo "waiting for the S3 endpoint..."
           for i in $(seq 1 30); do
-            if curl -sf http://localhost:9000/minio/health/live > /dev/null; then
-              echo "MinIO is up after ${i}0s"
+            if curl -s -o /dev/null http://localhost:9000; then
+              echo "S3 endpoint is up after $((i * 2))s"
               break
             fi
             if [ "$i" -eq 30 ]; then
-              echo "MinIO failed to become healthy in time"
-              docker logs minio
+              echo "S3 endpoint failed to come up in time"
+              docker logs s3
               exit 1
             fi
             sleep 2
           done
 
-      - name: create MinIO bucket
+      - name: create S3 bucket
         run: |
           aws --endpoint-url http://localhost:9000 s3 mb "s3://${EXPORT_S3_BUCKET}"
         env:

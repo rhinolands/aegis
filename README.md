@@ -69,7 +69,7 @@ This is the part worth reading the code for.
 ## What's actually built
 
 Verified by `npm test` (180 passing across 25 test files as of v0.1+G, plus the
-MinIO export integration test, which reports a real vitest **skip** unless
+S3 export integration test, which reports a real vitest **skip** unless
 `RUN_S3_INTEGRATION=1`) and `opa test policy/bundle` (9 passing). The suite grows
 as features land — run `npm test` for the current count.
 
@@ -107,7 +107,7 @@ For all three planes the upstream destination is **operator-configured, never ca
 - **Agent registration CLI** (`scripts/register.ts`) — the only way to create an agent identity, its tool/peer/model allowlist, and its scoped backend credential; returns the raw API key exactly once
 - **Helm chart** (`helm/aegis`) — k3s-first, single replica by design (see chart comments), pre-install migration Job, MinIO as the default object store
 - **`scripts/demo.sh`** — the five-minute end-to-end walkthrough (see [Demo](#demo) below)
-- **CI** — GitHub Actions (build, typecheck, `opa test`, Postgres + MinIO integration tests, gitleaks, CLA bot) and a Forgejo `workflow_dispatch` e2e job
+- **CI** — GitHub Actions (build, typecheck, `opa test`, Postgres + S3 (SeaweedFS) integration tests, gitleaks, CLA bot) and a Forgejo `workflow_dispatch` e2e job
 
 ## The destination is not the caller's to choose
 
@@ -152,12 +152,15 @@ opa test policy/bundle -v   # 9 policy tests
 
 The S3/MinIO export integration test only runs when `RUN_S3_INTEGRATION=1` is set
 (otherwise it reports as a real vitest **skip**, never a false pass). Run it against
-a local MinIO:
+any local S3-compatible store. CI uses SeaweedFS, since MinIO images are no longer
+anonymously pullable:
 
 ```bash
-docker run -d --name aegis-minio -p 9000:9000 \
-  -e MINIO_ROOT_USER=aegis -e MINIO_ROOT_PASSWORD=aegis12345 \
-  minio/minio server /data
+printf '{"identities":[{"name":"aegis","credentials":[{"accessKey":"aegis","secretKey":"aegis12345"}],"actions":["Admin","Read","Write","List","Tagging"]}]}' > /tmp/aegis-s3.json
+docker run -d --name aegis-s3 -p 9000:9000 \
+  -v /tmp/aegis-s3.json:/etc/seaweedfs/s3.json:ro \
+  chrislusf/seaweedfs:4.48 \
+  server -dir=/data -s3 -s3.port=9000 -s3.config=/etc/seaweedfs/s3.json
 
 export RUN_S3_INTEGRATION=1
 export EXPORT_S3_ENDPOINT=http://localhost:9000
