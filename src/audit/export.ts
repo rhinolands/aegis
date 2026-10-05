@@ -27,7 +27,7 @@ export function makeS3(cfg: Config): S3Client {
   return new S3Client({
     endpoint: cfg.s3.endpoint || undefined,
     region: cfg.s3.region,
-    forcePathStyle: true, // required for MinIO and other S3-compatible stores
+    forcePathStyle: true, // path-style addressing, required by self-hosted S3-compatible stores
     credentials: { accessKeyId: cfg.s3.accessKey, secretAccessKey: cfg.s3.secretKey },
   });
 }

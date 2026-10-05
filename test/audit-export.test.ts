@@ -72,12 +72,12 @@ describe('exportDay for a day with no records', () => {
     const { db, sql } = getDb(cfg);
     try {
       if (!s3Up) {
-        // MinIO unreachable in this environment — assert the pure,
+        // S3 store unreachable in this environment — assert the pure,
         // DB-derived + serialization parts of the reconciliation contract
         // directly, without routing through exportDay's S3 write (which
         // would throw on the broken/absent S3 config, not on the thing
         // this test cares about).
-        console.warn('[audit-export] MinIO unreachable — asserting pure parts of empty-day reconciliation only');
+        console.warn('[audit-export] S3 store unreachable — asserting pure parts of empty-day reconciliation only');
         const start = new Date(`${dayIso}T00:00:00.000Z`);
         const end = new Date(start.getTime() + 24 * 3600 * 1000);
         const dayRows = await db
@@ -114,19 +114,19 @@ describe('exportDay for a day with no records', () => {
   }, 30_000);
 });
 
-// --- Integration: real MinIO round-trip -----------------------------------
+// --- Integration: real S3 store round-trip --------------------------------
 // Contract: a skip must never be reported as a pass.
 //   - RUN_S3_INTEGRATION unset/!=1 -> real vitest skip (describe.skip), so the
 //     reporter shows "skipped", not green.
 //   - RUN_S3_INTEGRATION=1 -> the operator explicitly asked for this to run;
-//     if MinIO is unreachable in that case the test FAILS loudly (throws),
+//     if the S3 store is unreachable in that case the test FAILS loudly (throws),
 //     it does NOT silently return/skip.
 const runS3Integration = process.env.RUN_S3_INTEGRATION === '1';
 
-(runS3Integration ? describe : describe.skip)('exportDay against MinIO', () => {
+(runS3Integration ? describe : describe.skip)('exportDay against an S3 store', () => {
   const cfg = loadConfig(process.env);
-  let minioUp = true;
-  let minioError: unknown;
+  let storeUp = true;
+  let storeError: unknown;
   let s3: S3Client;
 
   beforeAll(async () => {
@@ -134,29 +134,29 @@ const runS3Integration = process.env.RUN_S3_INTEGRATION === '1';
     try {
       await s3.send(new HeadBucketCommand({ Bucket: cfg.s3.bucket }));
     } catch (err: any) {
-      // Bucket missing is fine — we create it. Connection refused etc means MinIO is down.
+      // Bucket missing is fine — we create it. Connection refused etc means the store is down.
       if (err?.name === 'NotFound' || err?.$metadata?.httpStatusCode === 404) {
         try {
           await s3.send(new CreateBucketCommand({ Bucket: cfg.s3.bucket }));
         } catch (createErr) {
-          minioUp = false;
-          minioError = createErr;
+          storeUp = false;
+          storeError = createErr;
         }
       } else if (err?.Code === 'NoSuchBucket') {
         await s3.send(new CreateBucketCommand({ Bucket: cfg.s3.bucket }));
       } else {
-        minioUp = false;
-        minioError = err;
+        storeUp = false;
+        storeError = err;
       }
     }
   }, 15_000);
 
-  it('exports today\'s audit records and the objects verify byte-for-byte in MinIO', async () => {
-    if (!minioUp) {
+  it('exports today\'s audit records and the objects verify byte-for-byte in the S3 store', async () => {
+    if (!storeUp) {
       // RUN_S3_INTEGRATION=1 means the operator explicitly asked for this to
-      // run — an unreachable MinIO here is a real failure, not a skip.
+      // run — an unreachable S3 store here is a real failure, not a skip.
       throw new Error(
-        `[audit-export] RUN_S3_INTEGRATION=1 but MinIO is unreachable at ${cfg.s3.endpoint}: ${String(minioError)}`,
+        `[audit-export] RUN_S3_INTEGRATION=1 but the S3 store is unreachable at ${cfg.s3.endpoint}: ${String(storeError)}`,
       );
     }
 
@@ -181,7 +181,7 @@ const runS3Integration = process.env.RUN_S3_INTEGRATION === '1';
       expect(result.recordCount).toBeGreaterThanOrEqual(2);
       expect(result.objects).toHaveLength(1);
 
-      // Read the segment back from MinIO and confirm the line count matches recordCount.
+      // Read the segment back from the S3 store and confirm the line count matches recordCount.
       const segObj = await s3.send(new GetObjectCommand({ Bucket: cfg.s3.bucket, Key: result.objects[0] }));
       const segmentBody = await segObj.Body!.transformToString();
       const lineCount = segmentBody.trimEnd().split('\n').length;

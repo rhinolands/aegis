@@ -172,7 +172,7 @@ npm test                    # unit + integration suite
 opa test policy/bundle -v   # 9 policy tests
 ```
 
-The S3/MinIO export integration test only runs when `RUN_S3_INTEGRATION=1` is set
+The S3 export integration test only runs when `RUN_S3_INTEGRATION=1` is set
 (otherwise it reports as a real vitest **skip**, never a false pass). Run it against
 any local S3-compatible store. CI uses SeaweedFS, since MinIO images are no longer
 anonymously pullable:
