@@ -13,6 +13,7 @@
     "register": "tsx scripts/register.ts",
     "update-agent": "tsx scripts/update-agent.ts",
     "ledger": "tsx scripts/ledger.ts",
+    "verify": "tsx scripts/verify.ts",
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
     "test:opa": "opa test policy/bundle -v",

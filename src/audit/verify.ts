@@ -4,9 +4,19 @@ import { auditRecords, chainHead } from '../db/schema.js';
 import { computeHash, GENESIS_HASH } from './chain.js';
 import type { AuditRecord } from './record.js';
 
-export interface VerifyResult { ok: boolean; checked: number; brokenAtSeq?: number; reason?: string }
+export interface VerifyResult {
+  ok: boolean; checked: number; brokenAtSeq?: number; reason?: string;
+  anchoredSeq?: number; // set when an export anchor was checked: the exported chain head seq
+}
 
-export async function verifyChain(db: DrizzleDb): Promise<VerifyResult> {
+// What an export recorded about the chain at export time (see audit/export.ts,
+// readExportAnchor): the chain head, plus seq and hash of every exported row.
+export interface ExportAnchor {
+  chainHead: { seq: number; hash: string } | null;
+  rows: Array<{ seq: number; hash: string }>;
+}
+
+export async function verifyChain(db: DrizzleDb, anchor?: ExportAnchor): Promise<VerifyResult> {
   // Rows and head are read in ONE repeatable-read snapshot. Read separately, an
   // append that commits between the two reads would look like a tail mismatch.
   const { rows, head } = await db.transaction(
@@ -18,6 +28,16 @@ export async function verifyChain(db: DrizzleDb): Promise<VerifyResult> {
     { isolationLevel: 'repeatable read', accessMode: 'read only' },
   );
 
+  const live = verifyLive(rows, head);
+  if (!live.ok || !anchor) return live;
+  return verifyAgainstExport(rows, anchor, live.checked);
+}
+
+type Row = typeof auditRecords.$inferSelect;
+type Head = typeof chainHead.$inferSelect;
+
+// The in-database check: every hash link, then the tail against chain_head.
+function verifyLive(rows: Row[], head: Head | undefined): VerifyResult {
   let prevHash = GENESIS_HASH;
   let checked = 0;
   for (const row of rows) {
@@ -64,4 +84,33 @@ export async function verifyChain(db: DrizzleDb): Promise<VerifyResult> {
     return { ok: false, checked, brokenAtSeq: last.seq, reason: `chain_head hash mismatch at seq ${last.seq}` };
   }
   return { ok: true, checked };
+}
+
+// The external check. verifyLive() cannot see a rewrite that stays self-consistent:
+// the hash is unkeyed and chain_head sits in the same database, so an owner can
+// delete the tail and move the head, empty both tables, or edit a row and recompute
+// every later hash. An export taken before the rewrite still holds the original
+// seq/hash pairs. Every exported row and the exported chain head must be present in
+// the live chain with the same hash. verifyLive() has already proven the live links
+// from genesis to the live head, so a live chain that contains the exported head
+// extends it.
+function verifyAgainstExport(rows: Row[], anchor: ExportAnchor, checked: number): VerifyResult {
+  const liveHash = new Map(rows.map((r) => [r.seq, r.hash]));
+  const compare = (seq: number, hash: string, what: string): VerifyResult | undefined => {
+    const found = liveHash.get(seq);
+    if (found === undefined) {
+      return { ok: false, checked, brokenAtSeq: seq, reason: `export mismatch: ${what} seq ${seq} is missing from the live chain` };
+    }
+    if (found !== hash) {
+      return { ok: false, checked, brokenAtSeq: seq, reason: `export mismatch: hash differs at ${what} seq ${seq}` };
+    }
+    return undefined;
+  };
+  for (const exported of anchor.rows) {
+    const broken = compare(exported.seq, exported.hash, 'exported');
+    if (broken) return broken;
+  }
+  if (!anchor.chainHead) return { ok: true, checked };
+  return compare(anchor.chainHead.seq, anchor.chainHead.hash, 'exported chain head')
+    ?? { ok: true, checked, anchoredSeq: anchor.chainHead.seq };
 }
