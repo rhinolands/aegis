@@ -33,4 +33,24 @@ describe('appendAudit', () => {
     await expect(sql`delete from audit_records`).rejects.toThrow();
     await sql.end();
   });
+  // Regression: TRUNCATE fires no row-level trigger, so the UPDATE/DELETE trigger above
+  // never saw it. The test connection is the table owner, so only a statement-level
+  // BEFORE TRUNCATE trigger can be what raises here.
+  it('DB blocks TRUNCATE on audit_records and chain_head, and the rows survive', async () => {
+    const { db, sql } = getDb(cfg);
+    await appendAudit(db, cfg, mk('allow'));
+    const count = async () => {
+      const [a] = await sql`select count(*)::int as n from audit_records`;
+      const [h] = await sql`select count(*)::int as n from chain_head`;
+      return { audit: a.n as number, head: h.n as number };
+    };
+    const before = await count();
+    await expect(sql`truncate audit_records`).rejects.toThrow(/audit_records is append-only \(TRUNCATE\)/);
+    await expect(sql`truncate chain_head`).rejects.toThrow(/chain_head is append-only \(TRUNCATE\)/);
+    await expect(sql`truncate audit_records, chain_head`).rejects.toThrow(/append-only \(TRUNCATE\)/);
+    await expect(sql`truncate audit_records cascade`).rejects.toThrow(/append-only \(TRUNCATE\)/);
+    expect(before.audit).toBeGreaterThan(0);
+    expect(await count()).toEqual(before);
+    await sql.end();
+  });
 });

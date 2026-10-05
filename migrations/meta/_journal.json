@@ -22,6 +22,13 @@
       "when": 1784729321450,
       "tag": "0002_credential_upstream_url",
       "breakpoints": true
+    },
+    {
+      "idx": 3,
+      "version": "7",
+      "when": 1791214989001,
+      "tag": "0003_audit_no_truncate",
+      "breakpoints": true
     }
   ]
 }
