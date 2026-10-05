@@ -2,7 +2,11 @@ import { createHash } from 'node:crypto';
 
 export interface IdentityChain { agent: string; onBehalfOf: string[] }
 export interface AuditWho { agentId: string; identity: IdentityChain }
-export interface AuditWhat { target: string; operation: string; argsDigest: string }
+// `change` is set only on operator records (plane 'operator'): the changed field names
+// and sha256 digests of the agent's non-secret configuration before and after. Records
+// without it hash exactly as before.
+export interface AuditChange { fields: string[]; before: string | null; after: string | null }
+export interface AuditWhat { target: string; operation: string; argsDigest: string; change?: AuditChange }
 export interface AuditWhenWhere { origin: string; correlationId: string }
 export interface AuditWhy { reason: string; approval?: { by: string; granted: boolean } }
 
@@ -10,7 +14,7 @@ export interface AuditRecord {
   id: string;
   ts: string;                 // ISO 8601
   tenant: string;
-  plane: 'mcp' | 'a2a' | 'llm' | 'approval';
+  plane: 'mcp' | 'a2a' | 'llm' | 'approval' | 'operator';
   who: AuditWho;
   what: AuditWhat;
   whenWhere: AuditWhenWhere;

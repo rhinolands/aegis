@@ -13,6 +13,13 @@
 #   6. Cover the tracks: the same attacker deletes that last record outright.
 #      Every remaining link is intact, so only the comparison against chain_head
 #      can see it. verifyChain() -> FAILS with "tail truncated".
+#   7. Operator change, on a fresh chain (steps 5 and 6 broke the old one on
+#      purpose): the operator adds the denied tool to the allowlist. The change is
+#      itself a record in the chain (who, what, config before and after). Rewrite
+#      that record so it claims nothing changed -> verifyChain() -> FAILS.
+#
+# Registration (step 1) is an operator change too, so the chain verified in
+# step 4 holds three records: the registration, the allow and the deny.
 #
 # Self-contained: starts the echo upstream and the gateway itself if they are
 # not already running, waits for readiness (no blind sleeps), and stops only
@@ -74,7 +81,9 @@ pause() {
 : "${PORT:=8080}"
 : "${BASE:=http://localhost:${PORT}}"
 : "${ECHO_PORT:=7070}"
-export DATABASE_URL AUDIT_MASTER_KEY PORT
+# Operator name written into operator records (asserted by the CLI, not authenticated).
+: "${AEGIS_OPERATOR:=demo-operator}"
+export DATABASE_URL AUDIT_MASTER_KEY PORT AEGIS_OPERATOR
 
 RUN_ID="$(date +%s)-$$"
 AGENT_NAME="demo-agent-${RUN_ID}"
@@ -275,6 +284,7 @@ console.log(JSON.stringify({
 '
 info "api key issued: ${API_KEY:0:14}... (never logged in full. register.ts prints it exactly once)"
 pass "agent registered. it can call '${TOOL}' and nothing else"
+info "the registration itself is an operator record in the audit chain (operator: ${AEGIS_OPERATOR})"
 pause
 
 # ---------------------------------------------------------------------------
@@ -325,7 +335,9 @@ VERIFY_1=$(run_verify)
 echo "    $VERIFY_1"
 printf '%s' "$VERIFY_1" | grep -q '"ok":true' \
   || fail "expected verifyChain to PASS on an untampered chain, got: $VERIFY_1"
-pass "chain verified. 2 records (1 allow, 1 deny), hashes match"
+printf '%s' "$VERIFY_1" | grep -q '"checked":3' \
+  || fail "expected 3 records (registration, allow, deny), got: $VERIFY_1"
+pass "chain verified. 3 records (1 operator registration, 1 allow, 1 deny), hashes match"
 pause  # dramatic beat: pressing Enter reveals the tamper attack
 
 # ---------------------------------------------------------------------------
@@ -379,9 +391,66 @@ printf '%s' "$VERIFY_3" | grep -q '"ok":false' \
   || fail "expected verifyChain to FAIL with a tail truncation after the last record was deleted, got: $VERIFY_3. this means a deleted record would go UNDETECTED"
 pass "chain verification correctly FAILED. chain_head still names seq $LAST_SEQ, so the missing tail was caught"
 
+pause  # next act: the operator, not the agent
+
+# ---------------------------------------------------------------------------
+# Step 7: an operator change is a record in the same chain; hiding it is caught
+# ---------------------------------------------------------------------------
+section "7. Operator adds '${DENIED_TOOL}' to the allowlist. the change is recorded. then hidden (expect FAIL)"
+psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -q -f scripts/reset-dev-chain.sql
+info "fresh chain: steps 5 and 6 left the old one broken on purpose"
+
+UPDATE_OUT=$(npx tsx scripts/update-agent.ts --agent-name "$AGENT_NAME" --allow-tool "$TOOL" --allow-tool "$DENIED_TOOL") \
+  || fail "update-agent failed"
+printf '%s' "$UPDATE_OUT" | node -e '
+const fs=require("fs");
+const o=JSON.parse(fs.readFileSync(0,"utf8"));
+console.log("    allowedTools now: " + JSON.stringify(o.allowedTools));
+'
+printf '%s    the operator record for that change (who / what / config before and after):%s\n' "$DIM" "$RESET"
+psql "$DATABASE_URL" -x -q -c "
+  SELECT seq,
+         plane,
+         who->>'agentId'                   AS who_channel,
+         who#>>'{identity,agent}'          AS who_operator,
+         what->>'target'                   AS what_target,
+         what->>'operation'                AS what_operation,
+         what#>>'{change,fields}'          AS changed_fields,
+         what#>>'{change,before}'          AS config_before,
+         what#>>'{change,after}'           AS config_after
+  FROM audit_records
+  WHERE plane = 'operator'
+  ORDER BY seq DESC LIMIT 1;
+" | reveal
+OP_COUNT=$(psql "$DATABASE_URL" -t -A -c "SELECT count(*) FROM audit_records WHERE plane = 'operator';")
+[ "$OP_COUNT" = "1" ] || fail "expected exactly 1 operator record for the allowlist change, found $OP_COUNT"
+
+VERIFY_4=$(run_verify)
+echo "    $VERIFY_4"
+printf '%s' "$VERIFY_4" | grep -q '"ok":true' \
+  || fail "expected verifyChain to PASS with the operator record in the chain, got: $VERIFY_4"
+pass "operator change recorded and the chain verifies"
+
+HIDE_SQL="ALTER TABLE audit_records DISABLE TRIGGER trg_audit_no_mutate;
+UPDATE audit_records
+   SET what = jsonb_set(jsonb_set(what, '{change,after}', what->'change'->'before'),
+                        '{change,fields}', '[]'::jsonb)
+ WHERE plane = 'operator';
+ALTER TABLE audit_records ENABLE TRIGGER trg_audit_no_mutate;"
+printf '%s    the attacker rewrites the record so it claims the allowlist never changed:%s\n' "$DIM" "$RESET"
+printf '%s' "$YELLOW"; printf '%s\n' "$HIDE_SQL" | sed 's/^/    /' | reveal; printf '%s' "$RESET"
+psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -q -c "$HIDE_SQL"
+
+VERIFY_5=$(run_verify)
+echo "    $VERIFY_5"
+printf '%s' "$VERIFY_5" | grep -q '"ok":false' \
+  && printf '%s' "$VERIFY_5" | grep -q 'hash mismatch' \
+  || fail "expected verifyChain to FAIL after the operator record was rewritten, got: $VERIFY_5. this means a hidden operator change would go UNDETECTED"
+pass "chain verification correctly FAILED. the hidden operator change was caught"
+
 # ---------------------------------------------------------------------------
 # Done
 # ---------------------------------------------------------------------------
 section "DEMO COMPLETE"
-echo "    allow logged, deny logged, chain verified, edit detected, tail deletion detected."
+echo "    allow logged, deny logged, chain verified, edit detected, tail deletion detected, operator change recorded and its cover-up detected."
 echo "    elapsed: ${SECONDS}s"

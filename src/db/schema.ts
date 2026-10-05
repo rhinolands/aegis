@@ -53,7 +53,7 @@ export const auditRecords = pgTable('audit_records', {
   ts: timestamp('ts', { withTimezone: true }).notNull().defaultNow(),
   tenant: text('tenant').notNull(),
   subjectKeyId: text('subject_key_id'),    // crypto-shred key id (null if no payload)
-  plane: text('plane').notNull(),          // 'mcp' | 'a2a' | 'llm' | 'approval'
+  plane: text('plane').notNull(),          // 'mcp' | 'a2a' | 'llm' | 'approval' | 'operator'
   who: jsonb('who').notNull(),             // injected identity + on-behalf-of chain
   what: jsonb('what').notNull(),           // target, operation, args digest
   whenWhere: jsonb('when_where').notNull(),// origin, correlation id

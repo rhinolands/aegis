@@ -19,7 +19,7 @@ Coverage keys: **Primary** = a core control directly addresses it. **Containment
 - **Identity injected, never asserted.** Identity is derived from the presented credential and the database, never from the request body. Each agent has its own app-only identity. No user impersonation: user actions carry user identity, agent actions carry agent identity plus an on-behalf-of chain.
 - **Guard: rate, quota, budget.** Per-agent limits evaluated before execution.
 - **Fail-closed everywhere.** Unknown caller, invalid credential, OPA error, missing budget, or upstream failure returns a denial plus an audit record. No path can throw past the wrapper or coerce a non-boolean into an allow.
-- **Tamper-evident audit.** Allows and denies are both recorded. Two database layers (privilege plus triggers that raise on update, delete, and truncate) stop mutation, and a hash chain detects it: `hash_n = sha256(hash_{n-1} || canonical(record_n))`. Chain verification detects a row edited (hash mismatch), a row deleted mid-chain or reordered (prevHash break), and deleted last rows or an emptied table (tail mismatch against the recorded chain head). Export to object storage as daily JSONL segments plus a sha256 manifest that records the chain head, WORM-optional. Limits are listed under [Audit integrity limits](#audit-integrity-limits).
+- **Tamper-evident audit.** Allows and denies are both recorded, and so are operator changes to the gateway's configuration made through its tooling. Two database layers (privilege plus triggers that raise on update, delete, and truncate) stop mutation, and a hash chain detects it: `hash_n = sha256(hash_{n-1} || canonical(record_n))`. Chain verification detects a row edited (hash mismatch), a row deleted mid-chain or reordered (prevHash break), and deleted last rows or an emptied table (tail mismatch against the recorded chain head). Export to object storage as daily JSONL segments plus a sha256 manifest that records the chain head, WORM-optional. Limits are listed under [Audit integrity limits](#audit-integrity-limits).
 
 ## OWASP LLM Top 10 mapping
 
@@ -44,7 +44,7 @@ Coverage keys: **Primary** = a core control directly addresses it. **Containment
 | Cross-agent privilege escalation | Primary | A2A peer allowlist (A may invoke only B.op if a rule exists) and agents never calling each other directly. Each agent has its own app-only identity plus an on-behalf-of chain, so one agent cannot borrow another's authority. |
 | Identity and impersonation | Primary | Identity is injected from the credential and database, not asserted from the request body. No user impersonation. Every action carries the identity it ran under. |
 | Compromised agent credential | Primary | The agent holds only its own key. The scoped backend credential lives in the gateway and is injected only after policy allows, so a stolen agent key cannot exfiltrate the backend token. |
-| Untraceable or repudiated actions | Primary | Hash-chained tamper-evident audit of allows and denies, two database immutability layers, chain verification that catches an edited row, a deleted row (mid-chain or at the tail), reordered rows, and an emptied table, and WORM-optional export whose manifest anchors the chain head outside the database. Answers who, what, when, where, why, and verdict for every decision. A database owner who rewrites history consistently is caught only by the exported manifest, and only for records exported before the rewrite. See [Audit integrity limits](#audit-integrity-limits). |
+| Untraceable or repudiated actions | Primary | Hash-chained tamper-evident audit of allows and denies, two database immutability layers, chain verification that catches an edited row, a deleted row (mid-chain or at the tail), reordered rows, and an emptied table, and WORM-optional export whose manifest anchors the chain head outside the database. Answers who, what, when, where, why, and verdict for every decision. A database owner who rewrites history consistently is caught only by the exported manifest, and only for records exported before the rewrite. See [Audit integrity limits](#audit-integrity-limits). Operator changes made through the tooling are recorded in the same chain, so who changed an allowlist, destination, credential or budget is answerable. Coverage for operator actions is partial. See [Operator plane](#operator-plane). |
 | Context or memory poisoning | Containment | Aegis does not inspect context. Poisoned context that drives the agent toward an action still meets deny-by-default and the allowlists at the boundary. |
 | Cascading multi-agent failure | Containment | The peer allowlist and per-agent scope stop a compromised or malfunctioning agent from expanding its reach across the fleet. |
 
@@ -57,7 +57,7 @@ Technique IDs and names are from MITRE ATLAS v5.6.0 (`mitre-atlas/atlas-data`, v
 | AML.T0053 AI Agent Tool Invocation | Primary | Per-agent tool allowlist plus deny-by-default. A tool the agent was never granted cannot be invoked through the gateway. |
 | AML.T0083 Credentials from AI Agent Configuration | Primary | The agent's configuration holds only its own key. Backend credentials live in the gateway's scoped store and are injected only after policy allows the call. |
 | AML.T0055 Unsecured Credentials | Primary for backend credentials | Backend secrets are encrypted at rest, scoped by agent and target, and never placed in the agent's environment. Credentials outside the gateway are out of scope. |
-| AML.T0081 Modify AI Agent Configuration | Primary for authority | Allowlists, destinations and credentials are operator-registered on the gateway, not read from the agent's configuration. An agent that edits its own configuration does not gain authority. |
+| AML.T0081 Modify AI Agent Configuration | Primary for authority | Allowlists, destinations and credentials are operator-registered on the gateway, not read from the agent's configuration. An agent that edits its own configuration does not gain authority. A change to the gateway-side configuration made through the operator tooling is recorded in the audit chain, in the same transaction as the change. A change written straight to the database is not recorded. See [Operator plane](#operator-plane). |
 | AML.T0034 Cost Harvesting | Primary | The guard (rate, quota, budget) runs before execution, and the LLM plane meters tokens and cost. An agent with no configured budget is denied. |
 | AML.T0034.002 Agentic Resource Consumption | Primary | Same guard and metering apply to tool and model calls, so a coerced agent hits its budget instead of an open bill. |
 | AML.T0086 Exfiltration via AI Agent Tool Invocation | Containment | Only allowlisted tools are reachable, and their destinations are resolved server-side, so the caller cannot redirect a call to a server it controls. Data encoded into the parameters of an allowed tool is not inspected. |
@@ -72,6 +72,23 @@ Technique IDs and names are from MITRE ATLAS v5.6.0 (`mitre-atlas/atlas-data`, v
 | AML.T0110 AI Agent Tool Poisoning | Out of scope | Tool integrity is a supply-chain control. The gateway limits which tools and destinations are reachable, not what a tool's code does. |
 | AML.T0024 Exfiltration via AI Inference API | Out of scope | Model-level inference attacks on training data are a model and serving concern. |
 
+## Operator plane
+
+The gateway's own configuration (allowlists, destinations, credentials, budgets) is itself a target. Every row above assumes it is trustworthy, so it gets its own threat actor.
+
+- **In scope: a compromised primary admin.** An outside attacker who obtains the primary operator's access to the tooling or the database (ATLAS `AML.T0012` Valid Accounts describes how they get in). The aim is that such an attacker cannot change configuration or history without leaving evidence they cannot also remove.
+- **Explicit non-goal for now: a malicious or coerced insider.** One person who legitimately holds every authority. Defending against that needs a second human, not a second key, and is deferred.
+- **Second authority.** Wherever a control relies on one, it must be independent of the primary admin's signing key, object-store write credential, and host or account. If the same compromised machine or person can reach both, there is one authority, not two.
+
+Coverage today is partial, and these are the gaps:
+
+- Changes made through the operator tooling are recorded in the audit chain, each in the same transaction as the change. The operator name is asserted by the tooling, not authenticated.
+- A change written straight to the database leaves no record. The recorded configuration digests make it detectable later, by comparing the live configuration against the last record, but that check is not built.
+- Nothing authorizes or bounds an operator change.
+- A compromised admin with database-owner access can still rewrite history consistently. That is caught only by an export taken before the rewrite. A scheduled export signed by a second authority is the planned control and is not built.
+
+Design: [docs/design/operator-audit.md](docs/design/operator-audit.md).
+
 ## Audit integrity limits
 
 The audit trail is tamper-evident, not tamper-proof. What each layer does and does not cover:
@@ -80,6 +97,7 @@ The audit trail is tamper-evident, not tamper-proof. What each layer does and do
 - **Trigger layer.** Update, delete, and truncate on the audit table, and truncate on the chain head, raise for every role. An owner or superuser can disable the triggers. Prevention ends here.
 - **Chain verification.** Run against the live database, it catches an edited row, a row deleted mid-chain, reordered rows, deleted last rows, an emptied audit table whose head remains, and a removed or altered chain head. It does not catch a rewrite that stays self-consistent. The hash is unkeyed and the chain head is stored in the same database, so an owner can delete the tail and rewrite the head to match, empty both tables, or edit a row and recompute every later hash and the head. All three pass verification.
 - **Exported manifest.** Each export records the chain head in object storage. A rewrite of any record at or before that exported head no longer matches it. This is the only layer that catches the owner rewrites above. It does not cover records written after the most recent export, so with a daily export a thorough owner-level rewrite of the last day's records is not detectable. The export is a function the operator must schedule. Nothing in the repository runs it automatically yet, and without it this layer does not exist. It is no anchor if the database owner can also rewrite the object store. Use a separate credential and WORM or object lock. The comparison of the live chain against a downloaded export is an operator-run command (`npm run verify -- --manifest <path>`). It requires every exported record and the exported chain head to be present in the live chain with the same hash. It is not run on a schedule.
+- **Operator records.** Operator changes made through the tooling are records in the same chain, so editing or deleting one is caught like any other record. A configuration change written straight to the database bypasses the tooling and leaves no record at all.
 - **Payload ciphertext.** The chain hashes the record skeleton, including the digest of the arguments, and not the encrypted payload. A replaced payload is detectable by decrypting it and comparing its hash to the chained digest. Chain verification does not perform that step, and after a subject key is shredded it cannot be performed at all.
 
 ## Non-goals (explicit boundaries)

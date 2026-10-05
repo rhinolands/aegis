@@ -85,6 +85,14 @@
 //   There is deliberately NO price-gate twin for tools (see the validation
 //   block below for the full reasoning): Aegis has no Acme tool catalog, and
 //   inventing one here would be a second source of truth.
+//
+// EVERY WRITE IS AN OPERATOR RECORD IN THE AUDIT CHAIN.
+//   Each write unit below (the allowlist UPDATE, each credential swap, the budget
+//   write) runs through auditedChange(): the write and its operator record commit in
+//   one transaction, so a change cannot land without its record. The record names
+//   the operator (AEGIS_OPERATOR or the OS user, asserted, not authenticated), the
+//   operation, the changed fields and digests of the non-secret configuration before
+//   and after. The secret never enters it. See docs/design/operator-audit.md.
 
 import { and, eq, sql as dsql } from 'drizzle-orm';
 import { readFileSync } from 'node:fs';
@@ -95,6 +103,7 @@ import { agents, budgets, scopedCredentials } from '../src/db/schema.js';
 import { putCredential } from '../src/credentials/store.js';
 import { seedBudget } from '../src/guard/budget.js';
 import { MODEL_PRICES } from '../src/pricing/models.js';
+import { auditedChange, operatorFromEnv, type OperatorContext } from '../src/audit/operator.js';
 
 /** The one scoped-credential target this CLI manages. */
 export const LLM_TARGET = 'llm:anthropic';
@@ -121,6 +130,8 @@ export interface UpdateAgentOptions {
   mcpUpstreamBase?: string;
   tokenLimit?: number;
   costLimitMicros?: number;
+  /** Who is making the change, for the operator audit record. Defaults to AEGIS_OPERATOR or the OS user. */
+  operator?: OperatorContext;
 }
 
 export interface UpdateAgentResult {
@@ -426,6 +437,8 @@ export async function updateAgent(
   }
 
   // ---- writes ----
+  // One operator context per invocation: every record it writes shares its correlation id.
+  const op = opts.operator ?? operatorFromEnv('cli:update-agent');
   let allowedModels = agent.allowedModels;
   let allowedTools = agent.allowedTools;
   if (models !== undefined || tools !== undefined) {
@@ -434,13 +447,14 @@ export async function updateAgent(
     // whose flag was not supplied is not in the SET clause at all, so an
     // invocation that touches only one allowlist leaves the other byte-identical
     // rather than rewriting it with a value read a moment earlier.
-    const [updated] = await db.update(agents)
-      .set({
-        ...(models !== undefined ? { allowedModels: models } : {}),
-        ...(tools !== undefined ? { allowedTools: tools } : {}),
-      })
-      .where(eq(agents.id, agent.id))
-      .returning();
+    const [updated] = await auditedChange(db, cfg, op, { agentName: agent.name, operation: 'agent.allowlist.update' },
+      (tx) => tx.update(agents)
+        .set({
+          ...(models !== undefined ? { allowedModels: models } : {}),
+          ...(tools !== undefined ? { allowedTools: tools } : {}),
+        })
+        .where(eq(agents.id, agent.id))
+        .returning());
     allowedModels = updated.allowedModels;
     allowedTools = updated.allowedTools;
   }
@@ -462,7 +476,7 @@ export async function updateAgent(
     // governed LLM traffic then fails closed on every call until an operator
     // re-seeds, and the count==1 post-condition below cannot catch it: that
     // check only runs when the process survives to reach it.
-    await db.transaction(async (tx) => {
+    await auditedChange(db, cfg, op, { agentName: agent.name, operation: 'credential.set' }, async (tx) => {
       await tx.delete(scopedCredentials).where(credWhere);
       await putCredential(tx, cfg, agent.id, LLM_TARGET, secret as string, upstreamOrigin as string);
     });
@@ -499,7 +513,7 @@ export async function updateAgent(
     // pair rather than around the whole loop so a fault on pair N cannot undo
     // the pairs already written; the throw aborts the loop, so no later pair is
     // half-applied either.
-    await db.transaction(async (tx) => {
+    await auditedChange(db, cfg, op, { agentName: agent.name, operation: 'credential.set' }, async (tx) => {
       await tx.delete(scopedCredentials).where(where);
       await putCredential(tx, cfg, agent.id, pair.target, secret as string, pair.upstreamUrl);
     });
@@ -537,7 +551,8 @@ export async function updateAgent(
     // Reuse the existing idempotent budget writer rather than forking a second
     // one. It sets the two LIMIT columns only, so the running meter columns are
     // untouched — raising a cap must never silently refund spend.
-    await seedBudget(db, agent.id, tokenLimit, costLimitMicros);
+    await auditedChange(db, cfg, op, { agentName: agent.name, operation: 'budget.update' },
+      (tx) => seedBudget(tx, agent.id, tokenLimit, costLimitMicros));
     budget = { tokenLimit, costLimitMicros };
   }
 

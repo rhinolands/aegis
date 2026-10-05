@@ -19,12 +19,51 @@
 //   so an agent registered without one cannot make a governed call.
 //   The raw API key is printed exactly once, in the final JSON — it is never
 //   recoverable afterward. Nothing you pass on the command line is logged.
+//   The registration (agent, API key, budget, credential) and its operator record
+//   in the audit chain commit in ONE transaction, or not at all. The operator is
+//   AEGIS_OPERATOR or the OS user, asserted, not authenticated.
 
 import { loadConfig } from '../src/config.js';
 import { getDb } from '../src/db/client.js';
 import { registerAgent } from '../src/identity/registry.js';
 import { seedBudget } from '../src/guard/budget.js';
 import { putCredential } from '../src/credentials/store.js';
+import { pathToFileURL } from 'node:url';
+import type { Config } from '../src/config.js';
+import type { DrizzleDb } from '../src/db/client.js';
+import { auditedChange, operatorFromEnv, type OperatorContext } from '../src/audit/operator.js';
+
+export interface RegisterCliInput {
+  name: string;
+  tenant: string;
+  tools: string[];
+  peers: string[];
+  models: string[];
+  tokenLimit: number;
+  costLimitMicros: number;
+  credTarget: string;
+  credSecret: string;
+  upstreamUrl: string;
+}
+
+// Every write of one registration plus its operator record, in one transaction.
+export async function registerWithAudit(
+  db: DrizzleDb, cfg: Config, input: RegisterCliInput,
+  op: OperatorContext = operatorFromEnv('cli:register'),
+) {
+  return auditedChange(db, cfg, op, { agentName: input.name, operation: 'agent.register' }, async (tx) => {
+    const { agent, apiKey } = await registerAgent(tx, {
+      name: input.name,
+      tenant: input.tenant,
+      allowedTools: input.tools,
+      allowedPeers: input.peers,
+      allowedModels: input.models,
+    });
+    await seedBudget(tx, agent.id, input.tokenLimit, input.costLimitMicros);
+    await putCredential(tx, cfg, agent.id, input.credTarget, input.credSecret, input.upstreamUrl);
+    return { agent, apiKey };
+  });
+}
 
 interface Args {
   name?: string;
@@ -112,15 +151,18 @@ async function main(): Promise<void> {
   const cfg = loadConfig(process.env);
   const { db, sql } = getDb(cfg);
   try {
-    const { agent, apiKey } = await registerAgent(db, {
+    const { agent, apiKey } = await registerWithAudit(db, cfg, {
       name: args.name!,
       tenant: args.tenant!,
-      allowedTools: args.tools,
-      allowedPeers: args.peers,
-      allowedModels: args.models,
+      tools: args.tools,
+      peers: args.peers,
+      models: args.models,
+      tokenLimit: args.tokenLimit,
+      costLimitMicros: args.costLimitMicros,
+      credTarget: args.credTarget!,
+      credSecret: args.credSecret!,
+      upstreamUrl: args.upstreamUrl!,
     });
-    await seedBudget(db, agent.id, args.tokenLimit, args.costLimitMicros);
-    await putCredential(db, cfg, agent.id, args.credTarget!, args.credSecret!, args.upstreamUrl);
 
     // Print exactly once: this is the only time the raw key is ever visible.
     console.log(JSON.stringify({
@@ -139,7 +181,12 @@ async function main(): Promise<void> {
   }
 }
 
-main().catch((err) => {
-  console.error('register failed:', (err as Error).message);
-  process.exit(1);
-});
+// Only run when invoked as the entry point: the test imports registerWithAudit(),
+// and an unconditional main() would fire, and exit the test process, on import.
+const entry = process.argv[1];
+if (entry !== undefined && import.meta.url === pathToFileURL(entry).href) {
+  main().catch((err) => {
+    console.error('register failed:', (err as Error).message);
+    process.exit(1);
+  });
+}

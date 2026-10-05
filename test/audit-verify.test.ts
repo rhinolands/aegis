@@ -1,5 +1,4 @@
 import { describe, it, expect, beforeEach, afterAll } from 'vitest';
-import postgres, { type Sql, type TransactionSql } from 'postgres';
 import { getDb } from '../src/db/client.js';
 import { loadConfig } from '../src/config.js';
 import { appendAudit } from '../src/audit/writer.js';
@@ -12,6 +11,7 @@ import { join, basename } from 'node:path';
 import type { DrizzleDb } from '../src/db/client.js';
 import { runVerify } from '../scripts/verify.js';
 import type { AuditRecord } from '../src/audit/record.js';
+import { resetChain as resetChainFor, asOwner } from './helpers/chain.js';
 
 const cfg = loadConfig(process.env);
 const mk = (): AuditRecord => ({
@@ -26,26 +26,7 @@ const mk = (): AuditRecord => ({
 // chain, so each one starts from an empty chain and the file leaves an empty chain
 // behind. Without this, a tampered row left by one test breaks verifyChain() for every
 // later test file and for the next local run.
-// max: 1 because the script carries its own BEGIN/COMMIT, which postgres.js only allows
-// on a single-connection client.
-async function resetChain(): Promise<void> {
-  const sql = postgres(cfg.databaseUrl, { max: 1 });
-  await sql.file('scripts/reset-dev-chain.sql');
-  await sql.end();
-}
-
-// Simulate an attacker holding owner DB credentials: disable the append-only triggers,
-// mutate, re-enable. One transaction: DDL is transactional, so the disabled-trigger
-// state is never committed/visible to other sessions.
-async function asOwner(sql: Sql, mutate: (tx: TransactionSql) => Promise<unknown>): Promise<void> {
-  await sql.begin(async (tx) => {
-    await tx`alter table audit_records disable trigger user`;
-    await tx`alter table chain_head disable trigger user`;
-    await mutate(tx);
-    await tx`alter table audit_records enable trigger user`;
-    await tx`alter table chain_head enable trigger user`;
-  });
-}
+const resetChain = () => resetChainFor(cfg);
 
 describe('verifyChain', () => {
   beforeEach(resetChain);
