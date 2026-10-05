@@ -10,6 +10,9 @@
 #   5. Tamper with the latest record as an attacker with owner DB credentials
 #      would (disable the append-only trigger, edit, re-enable it), then
 #      verifyChain() -> FAILS, proving the edit is caught.
+#   6. Cover the tracks: the same attacker deletes that last record outright.
+#      Every remaining link is intact, so only the comparison against chain_head
+#      can see it. verifyChain() -> FAILS with "tail truncated".
 #
 # Self-contained: starts the echo upstream and the gateway itself if they are
 # not already running, waits for readiness (no blind sleeps), and stops only
@@ -148,6 +151,20 @@ print_record() {
   " | reveal
 }
 
+# Runs verifyChain() against the live database and prints its JSON result.
+run_verify() {
+  node --input-type=module -e '
+import { loadConfig } from "./dist/config.js";
+import { getDb } from "./dist/db/client.js";
+import { verifyChain } from "./dist/audit/verify.js";
+const cfg = loadConfig(process.env);
+const { db, sql } = getDb(cfg);
+const r = await verifyChain(db);
+console.log(JSON.stringify(r));
+await sql.end();
+'
+}
+
 pretty_json_file() {
   { node -e 'const fs=require("fs");console.log(JSON.stringify(JSON.parse(fs.readFileSync(process.argv[1],"utf8")),null,2))' "$1" \
     2>/dev/null || cat "$1"; } | reveal
@@ -226,8 +243,11 @@ fi
 # Clean slate: start from an unambiguous, empty hash chain.
 # ---------------------------------------------------------------------------
 section "Resetting to a clean chain"
-psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -q -c 'TRUNCATE audit_records, chain_head;'
-info "audit_records + chain_head truncated. every record below is new"
+# A plain TRUNCATE is refused by the append-only triggers, for the owner too. The
+# reset script is the explicit owner-level bypass (disable triggers, truncate,
+# re-enable, one transaction). Dev and demo databases only.
+psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -q -f scripts/reset-dev-chain.sql
+info "audit_records + chain_head reset (scripts/reset-dev-chain.sql). every record below is new"
 pass "clean chain"
 pause  # presenter: start recording here, then Enter to begin beat 1
 
@@ -301,16 +321,7 @@ pause
 # Step 4: chain verification. must PASS
 # ---------------------------------------------------------------------------
 section "4. Chain verification (expect PASS)"
-VERIFY_1=$(node --input-type=module -e '
-import { loadConfig } from "./dist/config.js";
-import { getDb } from "./dist/db/client.js";
-import { verifyChain } from "./dist/audit/verify.js";
-const cfg = loadConfig(process.env);
-const { db, sql } = getDb(cfg);
-const r = await verifyChain(db);
-console.log(JSON.stringify(r));
-await sql.end();
-')
+VERIFY_1=$(run_verify)
 echo "    $VERIFY_1"
 printf '%s' "$VERIFY_1" | grep -q '"ok":true' \
   || fail "expected verifyChain to PASS on an untampered chain, got: $VERIFY_1"
@@ -337,25 +348,40 @@ psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -q -c "$TAMPER_SQL"
 AFTER=$(psql "$DATABASE_URL" -t -A -c "SELECT seq || '|' || verdict FROM audit_records WHERE seq = (SELECT max(seq) FROM audit_records);")
 info "target record after tamper:  seq|verdict = $AFTER (trigger disabled, edited, re-enabled)"
 
-VERIFY_2=$(node --input-type=module -e '
-import { loadConfig } from "./dist/config.js";
-import { getDb } from "./dist/db/client.js";
-import { verifyChain } from "./dist/audit/verify.js";
-const cfg = loadConfig(process.env);
-const { db, sql } = getDb(cfg);
-const r = await verifyChain(db);
-console.log(JSON.stringify(r));
-await sql.end();
-')
+VERIFY_2=$(run_verify)
 echo "    $VERIFY_2"
 printf '%s' "$VERIFY_2" | grep -q '"ok":false' \
   && printf '%s' "$VERIFY_2" | grep -q 'hash mismatch' \
   || fail "expected verifyChain to FAIL with a hash mismatch after tampering, got: $VERIFY_2. this means a tampered record would go UNDETECTED"
 pass "chain verification correctly FAILED. the tampered record was caught"
+pause  # next beat: the attacker tries to hide the evidence instead
+
+# ---------------------------------------------------------------------------
+# Step 6: delete the last record outright (tail truncation), then re-verify
+# ---------------------------------------------------------------------------
+section "6. Delete the last record to cover the tracks, then re-verify (expect FAIL)"
+LAST_SEQ=$(psql "$DATABASE_URL" -t -A -c "SELECT max(seq) FROM audit_records;")
+info "records before: $(psql "$DATABASE_URL" -t -A -c "SELECT count(*) FROM audit_records;"). deleting seq $LAST_SEQ, the record that was just caught"
+
+DELETE_SQL="ALTER TABLE audit_records DISABLE TRIGGER trg_audit_no_mutate;
+DELETE FROM audit_records
+ WHERE seq = (SELECT max(seq) FROM audit_records);
+ALTER TABLE audit_records ENABLE TRIGGER trg_audit_no_mutate;"
+printf '%s    with the edited record gone, every remaining hash link is intact again:%s\n' "$DIM" "$RESET"
+printf '%s' "$YELLOW"; printf '%s\n' "$DELETE_SQL" | sed 's/^/    /' | reveal; printf '%s' "$RESET"
+psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -q -c "$DELETE_SQL"
+info "records after:  $(psql "$DATABASE_URL" -t -A -c "SELECT count(*) FROM audit_records;") (trigger disabled, last row deleted, re-enabled)"
+
+VERIFY_3=$(run_verify)
+echo "    $VERIFY_3"
+printf '%s' "$VERIFY_3" | grep -q '"ok":false' \
+  && printf '%s' "$VERIFY_3" | grep -q 'tail truncated' \
+  || fail "expected verifyChain to FAIL with a tail truncation after the last record was deleted, got: $VERIFY_3. this means a deleted record would go UNDETECTED"
+pass "chain verification correctly FAILED. chain_head still names seq $LAST_SEQ, so the missing tail was caught"
 
 # ---------------------------------------------------------------------------
 # Done
 # ---------------------------------------------------------------------------
 section "DEMO COMPLETE"
-echo "    allow logged, deny logged, chain verified, tamper detected."
+echo "    allow logged, deny logged, chain verified, edit detected, tail deletion detected."
 echo "    elapsed: ${SECONDS}s"
