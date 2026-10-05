@@ -1,13 +1,23 @@
-import { asc } from 'drizzle-orm';
+import { asc, eq } from 'drizzle-orm';
 import type { DrizzleDb } from '../db/client.js';
-import { auditRecords } from '../db/schema.js';
+import { auditRecords, chainHead } from '../db/schema.js';
 import { computeHash, GENESIS_HASH } from './chain.js';
 import type { AuditRecord } from './record.js';
 
-export async function verifyChain(
-  db: DrizzleDb,
-): Promise<{ ok: boolean; checked: number; brokenAtSeq?: number; reason?: string }> {
-  const rows = await db.select().from(auditRecords).orderBy(asc(auditRecords.seq));
+export interface VerifyResult { ok: boolean; checked: number; brokenAtSeq?: number; reason?: string }
+
+export async function verifyChain(db: DrizzleDb): Promise<VerifyResult> {
+  // Rows and head are read in ONE repeatable-read snapshot. Read separately, an
+  // append that commits between the two reads would look like a tail mismatch.
+  const { rows, head } = await db.transaction(
+    async (tx) => {
+      const rows = await tx.select().from(auditRecords).orderBy(asc(auditRecords.seq));
+      const [head] = await tx.select().from(chainHead).where(eq(chainHead.id, 'head')).limit(1);
+      return { rows, head };
+    },
+    { isolationLevel: 'repeatable read', accessMode: 'read only' },
+  );
+
   let prevHash = GENESIS_HASH;
   let checked = 0;
   for (const row of rows) {
@@ -27,6 +37,31 @@ export async function verifyChain(
     }
     prevHash = row.hash;
     checked++;
+  }
+
+  // Tail check. Replaying the links above cannot see rows removed from the END of
+  // the chain: every remaining link is still intact, and an emptied table has no
+  // links to break. chain_head is advanced in the same transaction as every append
+  // (audit/writer.ts), so the last row must be exactly the recorded head.
+  const last = rows.at(-1);
+  if (!last) {
+    if (!head) return { ok: true, checked }; // never written: no rows, no head
+    return {
+      ok: false, checked, brokenAtSeq: head.seq,
+      reason: `chain truncated: chain_head seq ${head.seq}, audit_records is empty`,
+    };
+  }
+  if (!head) {
+    return { ok: false, checked, brokenAtSeq: last.seq, reason: `chain_head missing: last row ${last.seq} has no recorded head` };
+  }
+  if (head.seq > last.seq) {
+    return { ok: false, checked, brokenAtSeq: head.seq, reason: `tail truncated: chain_head seq ${head.seq}, last row ${last.seq}` };
+  }
+  if (head.seq < last.seq) {
+    return { ok: false, checked, brokenAtSeq: last.seq, reason: `chain_head stale: chain_head seq ${head.seq}, last row ${last.seq}` };
+  }
+  if (head.hash !== last.hash) {
+    return { ok: false, checked, brokenAtSeq: last.seq, reason: `chain_head hash mismatch at seq ${last.seq}` };
   }
   return { ok: true, checked };
 }
