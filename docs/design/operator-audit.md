@@ -176,11 +176,11 @@ Said plainly rather than forced:
 - **OWASP LLM Top 10.** No item is about operator configuration changes or audit-log integrity. None of the three steps changes an OWASP row. `LLM06` Excessive Agency is the nearest by subject and is unaffected, because the steps record and anchor changes and do not bound them.
 - **MITRE ATLAS.** `AML.T0081` fits step 1. `AML.T0012` Valid Accounts describes how a compromised primary admin gets in, and is a candidate for a new row once step 2 gives it real coverage. ATLAS has no technique for tampering with an audit log. The nearest are in ATT&CK Enterprise, `T1070` Indicator Removal and `T1565.001` Stored Data Manipulation, which the threat model does not map today. Steps 2 and 3 are therefore anchored in the "Audit integrity limits" section, not in an ATLAS row.
 
-## Questions only Gustavo can answer
+## Open questions for the maintainer
 
 1. **Digests only, or values too?** The decision says before and after digests. A digest proves the configuration changed and lets anyone check a claimed value. It does not, alone, say what the allowlist became. Allowlists and destinations are not secret, and the goal is tamper-evidence, not confidentiality. Recording the non-secret values in clear would make each record self-explanatory. Step 1 is built with digests plus the list of changed fields. Say if the values should be added.
 2. **Should the database refuse an unaudited config write?** A constraint trigger could reject any write to `agents` or `scoped_credentials` that is not in the same transaction as an operator record. That would close the direct-write gap for everyone except an owner who disables the trigger, the same limit as the existing triggers. It is a larger change and touches every test that registers an agent.
-3. **Is an asserted operator name acceptable for the public post,** given that the internal direction is an authenticated admin principal?
+3. **Is an asserted operator name acceptable for a first version,** or should operator identity be authenticated before this ships?
 4. **Export schedule for step 2.** Hourly, daily? It sets the undetectable window.
 5. **Where does the second key live** in the reference deployment: a second machine, or a separate account on the same one?
 6. **Is `AML.T0012` wanted as a row now** (marked partial) or only once step 2 lands?
