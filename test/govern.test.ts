@@ -7,6 +7,8 @@ import { seedBudget } from '../src/guard/budget.js';
 import { govern } from '../src/pipeline/govern.js';
 import { verifyChain } from '../src/audit/verify.js';
 import * as auditWriter from '../src/audit/writer.js';
+import { createHash } from 'node:crypto';
+import { getOrCreateSubjectKey, decryptPayload } from '../src/audit/crypto.js';
 
 const cfg = loadConfig(process.env);
 let engine: PolicyEngine;
@@ -29,6 +31,35 @@ describe('govern pipeline', () => {
     );
     expect(res.status).toBe(200);
     expect(executed).toBe(true);
+    await sql.end();
+  });
+
+  // The hash chain does not cover payload_ciphertext directly. This pins the indirect
+  // binding the README relies on: the encrypted payload is the same canonical args that
+  // what.argsDigest (which IS hashed) commits to, so decrypt-then-hash must reproduce it.
+  it('binds the encrypted payload to the chain: sha256(decrypted payload) equals the hashed argsDigest', async () => {
+    const { db, sql } = getDb(cfg);
+    const { agent } = await registerAgent(db, { name: `gov-bind-${Date.now()}`, tenant: 'test', allowedTools: ['fs.read'] });
+    await seedBudget(db, agent.id, 1_000_000, 1_000_000);
+    const correlationId = crypto.randomUUID();
+    const res = await govern(
+      { db, cfg, engine },
+      {
+        principal: { agentId: agent.id, name: agent.name, tenant: agent.tenant, onBehalfOf: [] },
+        agent, plane: 'mcp', request: { tool: 'fs.read', operation: 'call' },
+        target: 'mcp:filesystem', correlationId, origin: 'test',
+        args: { path: '/etc/hosts', flags: ['r'] },
+      },
+      async () => ({ tokens: 0, costMicros: 0, body: { ok: true } }),
+    );
+    expect(res.status).toBe(200);
+    const [row] = await sql`
+      select subject_key_id, payload_ciphertext, what->>'argsDigest' as args_digest
+      from audit_records where when_where->>'correlationId' = ${correlationId}`;
+    expect(row.payload_ciphertext).toBeTruthy();
+    const key = await getOrCreateSubjectKey(db, cfg, row.subject_key_id);
+    const plaintext = decryptPayload(key, row.payload_ciphertext);
+    expect(createHash('sha256').update(plaintext).digest('hex')).toBe(row.args_digest);
     await sql.end();
   });
 

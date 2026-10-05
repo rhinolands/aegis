@@ -19,7 +19,7 @@ Coverage keys: **Primary** = a core control directly addresses it. **Containment
 - **Identity injected, never asserted.** Identity is derived from the presented credential and the database, never from the request body. Each agent has its own app-only identity. No user impersonation: user actions carry user identity, agent actions carry agent identity plus an on-behalf-of chain.
 - **Guard: rate, quota, budget.** Per-agent limits evaluated before execution.
 - **Fail-closed everywhere.** Unknown caller, invalid credential, OPA error, missing budget, or upstream failure returns a denial plus an audit record. No path can throw past the wrapper or coerce a non-boolean into an allow.
-- **Tamper-evident audit.** Allows and denies are both recorded. Two database layers (privilege plus a before-update-or-delete trigger) stop mutation, and a hash chain proves it: `hash_n = sha256(hash_{n-1} || canonical(record_n))`. Chain verification detects a row edited (hash mismatch) or a row deleted or reordered (prevHash break). Daily export to object storage as JSONL plus a sha256 manifest, WORM-optional.
+- **Tamper-evident audit.** Allows and denies are both recorded. Two database layers (privilege plus triggers that raise on update, delete, and truncate) stop mutation, and a hash chain detects it: `hash_n = sha256(hash_{n-1} || canonical(record_n))`. Chain verification detects a row edited (hash mismatch), a row deleted mid-chain or reordered (prevHash break), and deleted last rows or an emptied table (tail mismatch against the recorded chain head). Export to object storage as daily JSONL segments plus a sha256 manifest that records the chain head, WORM-optional. Limits are listed under [Audit integrity limits](#audit-integrity-limits).
 
 ## OWASP LLM Top 10 mapping
 
@@ -44,7 +44,7 @@ Coverage keys: **Primary** = a core control directly addresses it. **Containment
 | Cross-agent privilege escalation | Primary | A2A peer allowlist (A may invoke only B.op if a rule exists) and agents never calling each other directly. Each agent has its own app-only identity plus an on-behalf-of chain, so one agent cannot borrow another's authority. |
 | Identity and impersonation | Primary | Identity is injected from the credential and database, not asserted from the request body. No user impersonation. Every action carries the identity it ran under. |
 | Compromised agent credential | Primary | The agent holds only its own key. The scoped backend credential lives in the gateway and is injected only after policy allows, so a stolen agent key cannot exfiltrate the backend token. |
-| Untraceable or repudiated actions | Primary | Hash-chained tamper-evident audit of allows and denies, two database immutability layers, chain verification that catches edit, delete, and reorder, and WORM-optional export. Answers who, what, when, where, why, and verdict for every decision. |
+| Untraceable or repudiated actions | Primary | Hash-chained tamper-evident audit of allows and denies, two database immutability layers, chain verification that catches an edited row, a deleted row (mid-chain or at the tail), reordered rows, and an emptied table, and WORM-optional export whose manifest anchors the chain head outside the database. Answers who, what, when, where, why, and verdict for every decision. A database owner who rewrites history consistently is caught only by the exported manifest, and only for records exported before the rewrite. See [Audit integrity limits](#audit-integrity-limits). |
 | Context or memory poisoning | Containment | Aegis does not inspect context. Poisoned context that drives the agent toward an action still meets deny-by-default and the allowlists at the boundary. |
 | Cascading multi-agent failure | Containment | The peer allowlist and per-agent scope stop a compromised or malfunctioning agent from expanding its reach across the fleet. |
 
@@ -72,6 +72,16 @@ Technique IDs and names are from MITRE ATLAS v5.6.0 (`mitre-atlas/atlas-data`, v
 | AML.T0110 AI Agent Tool Poisoning | Out of scope | Tool integrity is a supply-chain control. The gateway limits which tools and destinations are reachable, not what a tool's code does. |
 | AML.T0024 Exfiltration via AI Inference API | Out of scope | Model-level inference attacks on training data are a model and serving concern. |
 
+## Audit integrity limits
+
+The audit trail is tamper-evident, not tamper-proof. What each layer does and does not cover:
+
+- **Privilege layer.** The service role can only insert and select audit rows. This stops a compromised gateway process. It does nothing against the table owner or a superuser, and it only holds if the least-privilege role is actually deployed.
+- **Trigger layer.** Update, delete, and truncate on the audit table, and truncate on the chain head, raise for every role. An owner or superuser can disable the triggers. Prevention ends here.
+- **Chain verification.** Run against the live database, it catches an edited row, a row deleted mid-chain, reordered rows, deleted last rows, an emptied audit table whose head remains, and a removed or altered chain head. It does not catch a rewrite that stays self-consistent. The hash is unkeyed and the chain head is stored in the same database, so an owner can delete the tail and rewrite the head to match, empty both tables, or edit a row and recompute every later hash and the head. All three pass verification.
+- **Exported manifest.** Each export records the chain head in object storage. A rewrite of any record at or before that exported head no longer matches it. This is the only layer that catches the owner rewrites above. It does not cover records written after the most recent export, so with a daily export a thorough owner-level rewrite of the last day's records is not detectable. The export is a function the operator must schedule. Nothing in the repository runs it automatically yet, and without it this layer does not exist. It is no anchor if the database owner can also rewrite the object store. Use a separate credential and WORM or object lock. The comparison of the live chain against the manifest is a manual check today.
+- **Payload ciphertext.** The chain hashes the record skeleton, including the digest of the arguments, and not the encrypted payload. A replaced payload is detectable by decrypting it and comparing its hash to the chained digest. Chain verification does not perform that step, and after a subject key is shredded it cannot be performed at all.
+
 ## Non-goals (explicit boundaries)
 
 Aegis is not, and does not try to be:
@@ -87,4 +97,4 @@ These are real problems owned by other layers. Aegis composes with them: it is t
 
 If a requirement says the system **must not** do something, that belongs in an enforced control, not in a prompt the model is trusted to honor. Aegis is where that control lives for agent actions: deny-by-default, least-privilege, fail-closed, and provable after the fact.
 
-See the README for the architecture and the runnable demo (allow, deny, and a tampered audit record caught by the hash chain).
+See the README for the architecture and the runnable demo (allow, deny, a tampered audit record caught by the hash chain, and a deleted last record caught by the tail check).

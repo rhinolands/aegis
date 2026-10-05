@@ -56,11 +56,24 @@ Four governed planes, one pipeline: **ingress**, **A2A** (peer allowlist — A m
 
 This is the part worth reading the code for.
 
-**Hash chain.** `hash_n = sha256(hash_{n-1} ‖ canonical(record_n))`, where `canonical` is deterministic JSON with recursively sorted keys. `verifyChain()` replays the log in sequence order and recomputes every hash, detecting two distinct failure modes: a **hash mismatch** (a row was edited) and a **prevHash break** (a row was deleted or reordered).
+**Hash chain.** `hash_n = sha256(hash_{n-1} ‖ canonical(record_n))`, where `canonical` is deterministic JSON with recursively sorted keys. `verifyChain()` reads the log and `chain_head` in one snapshot, replays the log in sequence order and recomputes every hash. It reports three distinct failure modes: a **hash mismatch** (a row was edited), a **prevHash break** (a row was deleted from the middle of the chain, or rows were reordered), and a **tail mismatch** against `chain_head` (the last rows were deleted, the table was emptied, or the head itself was removed or altered). What it cannot see is listed in the table below.
 
-**Two layers of immutability.** The service role is granted `INSERT` + `SELECT` only on the audit table (a load-bearing GRANT), *and* a `BEFORE UPDATE OR DELETE` trigger raises on any mutation attempt. Both are exercised by tests.
+**Two layers of immutability.** The service role is granted `INSERT` + `SELECT` only on the audit table (a load-bearing GRANT), *and* triggers raise on any mutation attempt: a row-level `BEFORE UPDATE OR DELETE` trigger on the audit table, plus statement-level `BEFORE TRUNCATE` triggers on the audit table and on `chain_head`. Both layers are exercised by tests.
 
-**Proven, not asserted.** The tamper test doesn't politely try an `UPDATE` and check for an error. It simulates an attacker who already holds owner-level database credentials: it **disables the trigger**, edits a record, re-enables it — and then shows `verifyChain()` still catches the edit. Defence-in-depth means the cryptographic layer has to hold when the database layer is bypassed.
+**Proven, not asserted.** The tamper test doesn't politely try an `UPDATE` and check for an error. It simulates an attacker who already holds owner-level database credentials: it **disables the trigger**, edits a record, re-enables it — and then shows `verifyChain()` still catches the edit. Defence-in-depth means the cryptographic layer has to hold when the database layer is bypassed. The same test file repeats the attack for a deleted last row, an emptied table, and a removed, stale or altered `chain_head`. Each one must fail verification, and each test was confirmed to go red when the check it covers is reverted.
+
+### What each layer catches, and what it does not
+
+The first two layers prevent. The last two detect. None of them is complete alone, and the limits are stated here on purpose.
+
+| Layer | What it stops or catches | What it does not |
+|---|---|---|
+| **GRANT** (service role has `INSERT` + `SELECT` on `audit_records`) | A compromised gateway process cannot `UPDATE`, `DELETE` or `TRUNCATE` audit rows. | Does nothing against the table owner or a superuser. Only holds if the `aegis_service` role exists and the gateway connects as it. The service role must update `chain_head` to append, so it can corrupt the head, which verification then reports. |
+| **Triggers** | `UPDATE`, `DELETE` and `TRUNCATE` on `audit_records`, and `TRUNCATE` on `chain_head`, raise for every role, the owner included. | An owner or superuser can disable the triggers first. `scripts/reset-dev-chain.sql` does exactly that for dev resets. Prevention ends at this row. |
+| **`verifyChain()`** (in-database check) | An edited row. A row deleted mid-chain. Reordered rows. Deleted last rows. An emptied audit table whose head remains. A removed, stale or altered `chain_head`. | Any rewrite that stays self-consistent. The hash is unkeyed and `chain_head` lives in the same database as the rows, so a database owner can (1) delete the tail and rewrite `chain_head` to point at the new last row, (2) empty both tables, or (3) edit a row and recompute every later hash plus `chain_head`. All three verify clean. It also does not check payload ciphertext (see below). |
+| **Exported manifest** (external anchor) | Each export writes the chain head (`seq` and `hash`) as it stood at export time to object storage. Any rewrite of a record at or before that head no longer matches it. This is the only layer that catches the three owner rewrites above. | Records written after the most recent export. With a daily export that window is up to a day, and a thorough owner-level rewrite inside it is not detectable. The anchor only exists if the export actually runs: `exportDay()` is a function, and no scheduler, CLI or CronJob in this repo calls it yet, so the operator has to. It is no anchor at all if the database owner can also rewrite the object store, so keep the store behind a separate credential and enable WORM or object lock. The comparison of live chain against manifest is not automated yet. Today it is a manual check. |
+
+**What the hash covers.** The chain hashes the record skeleton: id, timestamp, tenant, plane, who, what (including `argsDigest`, the sha256 of the canonical arguments), when/where, why, verdict, policy version and subject key id. It does not hash `seq` (order is carried by the `prevHash` links) and it does not hash `payload_ciphertext`. The payload sits outside the hashed record by construction: it is the part crypto-shredding makes unreadable, while the skeleton is the part that has to keep verifying. The payload is still bound to the chain indirectly, because the plaintext that gets encrypted is the same canonical arguments that `argsDigest` commits to. Decrypt, hash, compare. A swapped ciphertext fails that comparison, and a corrupted one fails AES-GCM authentication. The limit: `verifyChain()` does not decrypt, so it does not run that comparison, and no shipped tool does yet. An owner who nulls or replaces a ciphertext is not flagged by chain verification, and once the subject key is shredded the comparison is impossible by design.
 
 **Crypto-shredding.** GDPR erasure versus immutability is a real conflict. Payloads are encrypted (AES-256-GCM) under a per-subject data key wrapped by a master key; erasure destroys the key row, rendering the payload unrecoverable while the chain skeleton — and therefore the integrity proof — stays intact.
 
@@ -81,8 +94,8 @@ as features land — run `npm test` for the current count.
 - Audit record schema, deterministic canonicalization, args digesting (raw arguments are never stored)
 - AES-256-GCM crypto-shred with per-subject wrapped keys
 - Hash chain + transactional append-only writer (chain head advanced under `SELECT … FOR UPDATE`)
-- Append-only enforcement: GRANT-level privileges **and** a mutation-blocking trigger
-- `verifyChain()` full-chain verification, with tamper detection proven against a trigger bypass
+- Append-only enforcement: GRANT-level privileges **and** mutation-blocking triggers (row-level `UPDATE`/`DELETE`, statement-level `TRUNCATE`)
+- `verifyChain()` full-chain verification including the tail check against `chain_head`, with edit, mid-chain delete, tail delete and truncation detection proven against a trigger bypass
 - OPA/Rego policy bundle — deny-by-default, tool/peer/model allowlists, compiled to WASM (`opa build -t wasm`)
 - In-process OPA evaluation with a fail-closed wrapper
 
@@ -103,7 +116,7 @@ For all three planes the upstream destination is **operator-configured, never ca
 - **G6 — correlation-id relay**: the gateway relays the caller's correlation id — server-authored from the same normalized id the audit record is built from, so the relayed header and the audited record can never disagree — to the operator-registered upstream on the MCP, A2A, and LLM planes, so a backend's own audit row joins back to the gateway decision. It is an opaque token: it selects no destination, carries no authority, and gates nothing.
 - A published `gateway_code` deny vocabulary lets the consuming product switch on a stable machine-readable code and render its own refusal copy, while the wire refusal stays deliberately generic (it never reveals which control refused).
 
-- **Object-storage export** — daily JSONL segments + sha256 manifest + chain-head pointer, written to any S3-compatible store (MinIO, S3, Azure Blob, GCS via interop endpoint)
+- **Object-storage export** — daily JSONL segments + sha256 manifest + chain-head pointer, written to any S3-compatible store (MinIO, S3, Azure Blob, GCS via interop endpoint). `exportDay()` is built and tested, but nothing in this repo schedules it yet. Running it daily is an operator task.
 - **Agent registration CLI** (`scripts/register.ts`) — the only way to create an agent identity, its tool/peer/model allowlist, and its scoped backend credential; returns the raw API key exactly once
 - **Helm chart** (`helm/aegis`) — k3s-first, single replica by design (see chart comments), pre-install migration Job, bring-your-own S3-compatible object store
 - **`scripts/demo.sh`** — the five-minute end-to-end walkthrough (see [Demo](#demo) below)
@@ -174,11 +187,13 @@ Migrations run with `client_min_messages=warning` (set on the connection in `dri
 
 The integration tests run against a real Postgres — no mocked database. They run serially by design: the hash chain is global singleton state, so parallel test files would interleave chain writes.
 
-Because the tamper test deliberately breaks the chain, a *second* consecutive local run needs a reset:
+The verification tests tamper with the chain on purpose, so that test file resets the chain before each test and leaves it empty when it finishes. The demo also leaves a tampered chain behind. After a demo run or an interrupted test run, reset by hand:
 
 ```bash
-docker exec aegis-pg psql -U aegis -d aegis -c "TRUNCATE audit_records, chain_head;"
+psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -q -f scripts/reset-dev-chain.sql
 ```
+
+A plain `TRUNCATE` of either table is refused by the append-only triggers, even for the owner. The reset script is the explicit owner-level bypass (disable triggers, truncate, re-enable, in one transaction). Both the test suite and the demo wipe the audit chain, so never point either at a database whose audit log matters.
 
 ## Helm (k3s-first)
 
@@ -218,6 +233,9 @@ starts (or reuses) the echo upstream and the gateway itself, then walks through:
 5. Tamper with the latest record the way an attacker holding owner-level DB
    credentials would (disable the append-only trigger, edit, re-enable it) →
    `verifyChain()` → **fails**, proving the edit is caught.
+6. Cover the tracks by deleting that last record outright. Every remaining hash
+   link is intact again, so only the comparison against `chain_head` can see it →
+   `verifyChain()` → **fails** with `tail truncated`.
 
 ```bash
 export DATABASE_URL=postgres://aegis:dev@localhost:5432/aegis   # dev only
@@ -234,11 +252,12 @@ Built test-first, one reviewed commit per task. A few things the process surface
 
 - The policy's `default` rule cannot reference the `policy_version` constant — OPA rejects variables in default rule values. The literal has to be duplicated, which creates a silent drift risk: a version bump would make *denied* requests misreport the policy version in the audit trail. There is now a regression test comparing the emitted version against the constant on both allow and deny paths, validated by injecting the drift and confirming the test fails.
 - `registerAgent` currently performs two non-transactional inserts. Known gap, tracked for the key-rotation work.
-- `TRUNCATE` is not caught by a row-level trigger. The append-only guarantee against truncation rests on the GRANT layer alone, which requires the least-privilege service role to actually exist — mandatory before any production deployment.
+- `TRUNCATE` is not caught by a row-level trigger, and `verifyChain()` originally never compared the log against `chain_head`. Together that meant an owner could delete the last record, or empty the table, and verification still passed. Both are closed: statement-level `BEFORE TRUNCATE` triggers, and a tail check in `verifyChain()`, each with a regression test confirmed to fail when the fix is reverted. The least-privilege service role is still mandatory before any production deployment, because triggers can be disabled by the owner.
+- An unkeyed hash chain stored next to its own head cannot, by itself, catch a database owner who rewrites history consistently. That is what the exported manifest is for. See the layer table under [The audit spine](#the-audit-spine) for the exact limits, including the window between exports.
 
 ## Roadmap
 
-v0.1 completes the four planes, guards, object-storage export, a k3s-first Helm chart, and a five-minute demo: register an agent → allowed tool call → unauthorized tool call returns 403 with a deny record → chain verification passes → tamper → chain verification fails.
+v0.1 completes the four planes, guards, object-storage export, a k3s-first Helm chart, and a five-minute demo: register an agent → allowed tool call → unauthorized tool call returns 403 with a deny record → chain verification passes → tamper → chain verification fails → delete the tampered record → chain verification still fails.
 
 Deliberately out of scope for v0.1: admin console, SSO/OIDC admin plane, content-safety guard models, policy-bundle signing, Envoy integration.
 
