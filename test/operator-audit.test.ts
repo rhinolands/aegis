@@ -64,10 +64,15 @@ describe('operator changes in the audit chain', () => {
     expect(rec.tenant).toBe('op-test');
     expect(rec.verdict).toBe('allow');
     expect(rec.policyVersion).toBe('none');
-    const what = rec.what as { target: string; operation: string; change: { fields: string[]; before: string; after: string } };
+    const what = rec.what as {
+      target: string; operation: string;
+      change: { fields: string[]; before: string; after: string; values: Record<string, { before: unknown; after: unknown }> };
+    };
     expect(what.target).toBe(`agent:${agent.name}`);
     expect(what.operation).toBe('agent.allowlist.update');
     expect(what.change.fields).toEqual(['allowedTools']);
+    // The record says what the allowlist became, not only that it changed.
+    expect(what.change.values).toEqual({ allowedTools: { before: ['echo'], after: ['echo', 'danger'] } });
     expect(what.change.before).toBe(before);
     expect(what.change.after).toBe(await agentConfigDigest(db, agent.name));
     expect(what.change.after).not.toBe(before);
@@ -112,6 +117,15 @@ describe('operator changes in the audit chain', () => {
       { target: LLM_TARGET, upstreamUrl: 'https://api.anthropic.com', fingerprint: sha256(stored.secretCiphertext) },
     ]);
 
+    const [credRec] = await operatorRecords(db, op.correlationId);
+    const credValues = (credRec.what as { change: { values: Record<string, { before: unknown; after: unknown }> } }).change.values;
+    expect(credValues).toEqual({
+      [`credentials[${LLM_TARGET}]`]: {
+        before: [],
+        after: [{ target: LLM_TARGET, upstreamUrl: 'https://api.anthropic.com', fingerprint: sha256(stored.secretCiphertext) }],
+      },
+    });
+
     // The whole stored record, every column, as text.
     const [row] = await sql`select row_to_json(a)::text as j from audit_records a where when_where->>'correlationId' = ${op.correlationId}`;
     expect(row.j).not.toContain(SECRET);
@@ -138,6 +152,14 @@ describe('operator changes in the audit chain', () => {
     expect(what.target).toBe(`agent:${agent.name}`);
     expect(what.change.before).toBeNull();
     expect(what.change.after).toBe(await agentConfigDigest(db, name));
+    // A registration records the whole starting configuration, field by field.
+    const regValues = (recs[0].what as { change: { values: Record<string, { before: unknown; after: unknown }> } }).change.values;
+    const regSnap = await agentConfigSnapshot(db, name);
+    expect(Object.keys(regValues).sort()).toEqual([...what.change.fields].sort());
+    expect(regValues.allowedTools).toEqual({ before: null, after: ['echo'] });
+    expect(regValues.budget).toEqual({ before: null, after: { tokenLimit: 100, costLimitMicros: 100 } });
+    expect(regValues.credentials).toEqual({ before: null, after: regSnap!.credentials });
+    expect(JSON.stringify(regValues)).not.toContain(SECRET);
     expect((recs[0].who as { identity: { agent: string } }).identity.agent).toBe('bob');
     await sql.end();
   });
@@ -226,6 +248,25 @@ describe('operator changes in the audit chain', () => {
     await asOwner(sql, (tx) => tx`
       update audit_records
          set what = jsonb_set(jsonb_set(what, '{change,after}', what->'change'->'before'), '{change,fields}', '[]'::jsonb)
+       where plane = 'operator' and when_where->>'correlationId' = ${op.correlationId}`);
+    const res = await verifyChain(db);
+    expect(res.ok).toBe(false);
+    expect(res.reason).toContain('hash mismatch');
+    await sql.end();
+  });
+
+  it('an operator record whose recorded values are rewritten fails verification', async () => {
+    const { db, sql } = getDb(cfg);
+    const agent = await newAgent(db);
+    const op = operator();
+    await updateAgent(db, cfg, { agentName: agent.name, allowTools: ['echo', 'danger'], operator: op });
+    expect((await verifyChain(db)).ok).toBe(true);
+
+    // Leave the digests and field names alone. Only rewrite the readable value, so
+    // the record says the allowlist stayed ['echo'].
+    await asOwner(sql, (tx) => tx`
+      update audit_records
+         set what = jsonb_set(what, '{change,values,allowedTools,after}', what->'change'->'values'->'allowedTools'->'before')
        where plane = 'operator' and when_where->>'correlationId' = ${op.correlationId}`);
     const res = await verifyChain(db);
     expect(res.ok).toBe(false);

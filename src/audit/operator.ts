@@ -98,6 +98,25 @@ export function changedFields(before: AgentConfigSnapshot | null, after: AgentCo
   return fields;
 }
 
+// The readable side of a change: for each changed field, its value before and after.
+// Everything in a snapshot is non-secret by construction (a credential is its target,
+// destination and ciphertext fingerprint), so the values can be recorded in clear. The
+// digests say THAT the configuration changed and let anyone check a claimed state.
+// The values say WHAT it became, so a reader does not have to guess.
+export function changedValues(
+  before: AgentConfigSnapshot | null, after: AgentConfigSnapshot | null, fields: string[],
+): Record<string, { before: unknown; after: unknown }> {
+  const pick = (snap: AgentConfigSnapshot | null, field: string): unknown => {
+    if (!snap) return null;
+    const target = /^credentials\[(.+)\]$/.exec(field)?.[1];
+    if (target !== undefined) return snap.credentials.filter((c) => c.target === target);
+    return snap[field as keyof AgentConfigSnapshot];
+  };
+  const values: Record<string, { before: unknown; after: unknown }> = {};
+  for (const field of fields) values[field] = { before: pick(before, field), after: pick(after, field) };
+  return values;
+}
+
 // Runs one config write and appends its operator record in ONE transaction: if the
 // audit append fails, the write rolls back. A config change through the tooling
 // cannot land without its record.
@@ -113,10 +132,12 @@ export async function auditedChange<T>(
     const before = await agentConfigSnapshot(tx, change.agentName);
     const result = await mutate(tx);
     const after = await agentConfigSnapshot(tx, change.agentName);
+    const fields = changedFields(before, after);
     const changeRecord = {
-      fields: changedFields(before, after),
+      fields,
       before: before ? argsDigest(before) : null,
       after: after ? argsDigest(after) : null,
+      values: changedValues(before, after, fields),
     };
     const rec: AuditRecord = {
       id: crypto.randomUUID(),

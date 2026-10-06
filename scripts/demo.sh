@@ -416,6 +416,7 @@ psql "$DATABASE_URL" -x -q -c "
          what->>'target'                   AS what_target,
          what->>'operation'                AS what_operation,
          what#>>'{change,fields}'          AS changed_fields,
+         what#>>'{change,values}'          AS changed_values,
          what#>>'{change,before}'          AS config_before,
          what#>>'{change,after}'           AS config_after
   FROM audit_records

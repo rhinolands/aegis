@@ -42,13 +42,15 @@ No new table and no new record type. An operator event is an ordinary audit reco
 | `what.target` | `agent:<name>` |
 | `what.operation` | `agent.register`, `agent.allowlist.update`, `credential.set`, `budget.update` |
 | `what.argsDigest` | sha256 of the canonical change description below |
-| `what.change` | `{ fields, before, after }`, new and optional |
+| `what.change` | `{ fields, before, after, values }`, new and optional |
 | `whenWhere` | origin `cli:register` or `cli:update-agent`, one correlation id per invocation |
 | `why.reason` | free text. The existing `approval` field is where an approver goes later |
 | `verdict` | `allow`, meaning the change was applied |
 | `policyVersion` | `none`. No policy bounds operator changes yet, and the record says so |
 
 `what.change.before` and `what.change.after` are sha256 digests of the agent's full non-secret configuration, taken inside the transaction before and after the write. `fields` lists what differed, for example `allowedTools` or `credentials[mcp:echo].upstreamUrl`. Because the whole `what` object is hashed, the new field is covered by the chain with no change to the hash function. Existing records have no `change` key, so their hashes are untouched and old chains verify as before.
+
+`what.change.values` holds, for each changed field, its value before and after. Every value in the configuration snapshot is non-secret by construction, so the record can say what the allowlist became, not only that it changed. The digests cover the whole configuration, the values cover the fields that moved, and both sit inside the hashed record.
 
 One verifier covers both kinds of record. `verifyChain()` is unchanged.
 
@@ -176,12 +178,17 @@ Said plainly rather than forced:
 - **OWASP LLM Top 10.** No item is about operator configuration changes or audit-log integrity. None of the three steps changes an OWASP row. `LLM06` Excessive Agency is the nearest by subject and is unaffected, because the steps record and anchor changes and do not bound them.
 - **MITRE ATLAS.** `AML.T0081` fits step 1. `AML.T0012` Valid Accounts describes how a compromised primary admin gets in, and is a candidate for a new row once step 2 gives it real coverage. ATLAS has no technique for tampering with an audit log. The nearest are in ATT&CK Enterprise, `T1070` Indicator Removal and `T1565.001` Stored Data Manipulation, which the threat model does not map today. Steps 2 and 3 are therefore anchored in the "Audit integrity limits" section, not in an ATLAS row.
 
-## Open questions for the maintainer
+## Decisions and open questions
 
-1. **Digests only, or values too?** The decision says before and after digests. A digest proves the configuration changed and lets anyone check a claimed value. It does not, alone, say what the allowlist became. Allowlists and destinations are not secret, and the goal is tamper-evidence, not confidentiality. Recording the non-secret values in clear would make each record self-explanatory. Step 1 is built with digests plus the list of changed fields. Say if the values should be added.
-2. **Should the database refuse an unaudited config write?** A constraint trigger could reject any write to `agents` or `scoped_credentials` that is not in the same transaction as an operator record. That would close the direct-write gap for everyone except an owner who disables the trigger, the same limit as the existing triggers. It is a larger change and touches every test that registers an agent.
-3. **Is an asserted operator name acceptable for a first version,** or should operator identity be authenticated before this ships?
-4. **Export schedule for step 2.** Hourly, daily? It sets the undetectable window.
-5. **Where does the second key live** in the reference deployment: a second machine, or a separate account on the same one?
-6. **Is `AML.T0012` wanted as a row now** (marked partial) or only once step 2 lands?
-7. **Plan V2 (the insider case) now, or leave it deferred with no date?**
+Decided for step 1 (6 Oct 2026):
+
+1. **Values are recorded next to the digests.** The goal is tamper-evidence, not confidentiality, and the configuration snapshot holds nothing secret. Each record carries the before and after value of every changed field.
+2. **The database does not yet refuse an unaudited config write.** A constraint trigger that rejects a write to `agents` or `scoped_credentials` outside a transaction that also writes an operator record is the next change after this one. Until then a direct database write leaves no record, as stated above.
+3. **An asserted operator name is accepted for this first version**, and the record says it is asserted. Authenticating the operator needs an admin plane, which is out of scope here.
+
+Open, for step 2 and later:
+
+4. **Export schedule.** Proposed default: daily, configurable. The schedule sets the undetectable window.
+5. **Where the second key lives** in the reference deployment. Proposed: a second machine. A separate account on the same machine is the minimum that still counts as independent.
+6. **Whether to add an ATLAS row for valid-account abuse** when step 2 lands. Not added now, so the mapping does not claim coverage that is only partial.
+7. **The insider case** (a second human as the second authority) stays deferred with no date, and is named as a non-goal.
