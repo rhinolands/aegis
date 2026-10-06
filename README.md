@@ -81,6 +81,8 @@ npm run verify -- --manifest ./audit/2026-10-05/manifest.json
 
 The tests show each of the three owner rewrites passing the in-database check and then failing against an export taken before the rewrite.
 
+**Operator changes are in the same chain.** Registering an agent, changing an allowlist, setting a credential or its destination, and changing a budget each write an operator record (`plane: operator`) in the same transaction as the change, so the change cannot land without its record. The record names the operator, the operation, each changed field with its value before and after, and sha256 digests of the agent's whole non-secret configuration before and after. A credential appears only as a fingerprint of its stored ciphertext, never as the secret or a hash of it. One `verifyChain()` covers agent and operator records alike. Limits, stated plainly: the operator name is asserted by the CLI (`AEGIS_OPERATOR` or the OS user), not authenticated. Nothing authorizes or bounds an operator change yet. A change written straight to the database, bypassing the CLI, leaves no record. Design and next steps: [docs/design/operator-audit.md](docs/design/operator-audit.md).
+
 **What the hash covers.** The chain hashes the record skeleton: id, timestamp, tenant, plane, who, what (including `argsDigest`, the sha256 of the canonical arguments), when/where, why, verdict, policy version and subject key id. It does not hash `seq` (order is carried by the `prevHash` links) and it does not hash `payload_ciphertext`. The payload sits outside the hashed record by construction: it is the part crypto-shredding makes unreadable, while the skeleton is the part that has to keep verifying. The payload is still bound to the chain indirectly, because the plaintext that gets encrypted is the same canonical arguments that `argsDigest` commits to. Decrypt, hash, compare. A swapped ciphertext fails that comparison, and a corrupted one fails AES-GCM authentication. The limit: `verifyChain()` does not decrypt, so it does not run that comparison, and no shipped tool does yet. An owner who nulls or replaces a ciphertext is not flagged by chain verification, and once the subject key is shredded the comparison is impossible by design.
 
 **Crypto-shredding.** GDPR erasure versus immutability is a real conflict. Payloads are encrypted (AES-256-GCM) under a per-subject data key wrapped by a master key; erasure destroys the key row, rendering the payload unrecoverable while the chain skeleton — and therefore the integrity proof — stays intact.
@@ -104,6 +106,7 @@ as features land — run `npm test` for the current count.
 - Hash chain + transactional append-only writer (chain head advanced under `SELECT … FOR UPDATE`)
 - Append-only enforcement: GRANT-level privileges **and** mutation-blocking triggers (row-level `UPDATE`/`DELETE`, statement-level `TRUNCATE`)
 - `verifyChain()` full-chain verification including the tail check against `chain_head`, with edit, mid-chain delete, tail delete and truncation detection proven against a trigger bypass
+- Operator changes recorded in the audit chain: registration, allowlists, credentials and destinations, budgets. Each config write and its record commit in one transaction, proven by tests that fail the audit append and check the configuration did not change
 - Verification against an exported manifest (`npm run verify -- --manifest <path>`), offline from a local copy of the export, proven against consistent owner-level rewrites that the in-database check cannot see
 - OPA/Rego policy bundle — deny-by-default, tool/peer/model allowlists, compiled to WASM (`opa build -t wasm`)
 - In-process OPA evaluation with a fail-closed wrapper
@@ -238,13 +241,17 @@ starts (or reuses) the echo upstream and the gateway itself, then walks through:
 2. **Allowed** tool call → `200`, and the upstream shows the gateway injected a
    scoped backend credential the caller never held.
 3. **Unauthorized** tool call (a tool not on the allowlist) → `403`, deny logged.
-4. `verifyChain()` → **passes** against the chain built by steps 2–3.
+4. `verifyChain()` → **passes** against the chain built by steps 1 to 3: three
+   records, because the registration in step 1 is itself an operator record.
 5. Tamper with the latest record the way an attacker holding owner-level DB
    credentials would (disable the append-only trigger, edit, re-enable it) →
    `verifyChain()` → **fails**, proving the edit is caught.
 6. Cover the tracks by deleting that last record outright. Every remaining hash
    link is intact again, so only the comparison against `chain_head` can see it →
    `verifyChain()` → **fails** with `tail truncated`.
+7. On a fresh chain, the operator adds the denied tool to the allowlist. The change
+   is shown as an operator record (who, what, configuration before and after).
+   Rewrite that record so it claims nothing changed → `verifyChain()` → **fails**.
 
 ```bash
 export DATABASE_URL=postgres://aegis:dev@localhost:5432/aegis   # dev only
@@ -260,7 +267,7 @@ its expected outcome — it never prints success regardless of what happened.
 Built test-first, one reviewed commit per task. A few things the process surfaced that are worth stating plainly:
 
 - The policy's `default` rule cannot reference the `policy_version` constant — OPA rejects variables in default rule values. The literal has to be duplicated, which creates a silent drift risk: a version bump would make *denied* requests misreport the policy version in the audit trail. There is now a regression test comparing the emitted version against the constant on both allow and deny paths, validated by injecting the drift and confirming the test fails.
-- `registerAgent` currently performs two non-transactional inserts. Known gap, tracked for the key-rotation work.
+- `registerAgent` performs two inserts with no transaction of its own. The registration CLI now runs the whole registration (agent, key, budget, credential) and its operator record in one transaction. A direct library call outside that path still does not.
 - `TRUNCATE` is not caught by a row-level trigger, and `verifyChain()` originally never compared the log against `chain_head`. Together that meant an owner could delete the last record, or empty the table, and verification still passed. Both are closed: statement-level `BEFORE TRUNCATE` triggers, and a tail check in `verifyChain()`, each with a regression test confirmed to fail when the fix is reverted. The least-privilege service role is still mandatory before any production deployment, because triggers can be disabled by the owner.
 - An unkeyed hash chain stored next to its own head cannot, by itself, catch a database owner who rewrites history consistently. That is what the exported manifest and `npm run verify -- --manifest` are for. See the layer table under [The audit spine](#the-audit-spine) for the exact limits, including the window between exports.
 
@@ -268,7 +275,7 @@ Built test-first, one reviewed commit per task. A few things the process surface
 
 v0.1 completes the four planes, guards, object-storage export, a k3s-first Helm chart, and a five-minute demo: register an agent → allowed tool call → unauthorized tool call returns 403 with a deny record → chain verification passes → tamper → chain verification fails → delete the tampered record → chain verification still fails.
 
-Deliberately out of scope for v0.1: admin console, SSO/OIDC admin plane, content-safety guard models, policy-bundle signing, Envoy integration.
+Deliberately out of scope for v0.1: admin console, SSO/OIDC admin plane (so operator identity in audit records is asserted, not authenticated), content-safety guard models, policy-bundle signing, Envoy integration.
 
 ## License
 
