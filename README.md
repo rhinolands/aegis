@@ -252,6 +252,14 @@ starts (or reuses) the echo upstream and the gateway itself, then walks through:
 7. On a fresh chain, the operator adds the denied tool to the allowlist. The change
    is shown as an operator record (who, what, configuration before and after).
    Rewrite that record so it claims nothing changed → `verifyChain()` → **fails**.
+8. On a fresh chain, an injected instruction. A second agent that may only read
+   tickets handles one that tells it to mail the data out. It was never given a
+   mail tool → `403`, deny logged. Then the limit, on purpose: the operator
+   grants the mail tool, the same two calls run again, and both are **allowed**.
+   The gateway does not detect the injection. It decides per call on tool, peer
+   and model, with no rule on call arguments or on sequences of calls, so the
+   grant is the security decision and the chain records who made it. No model
+   runs in this step: the script plays an agent that obeyed the injected text.
 
 ```bash
 export DATABASE_URL=postgres://aegis:dev@localhost:5432/aegis   # dev only
