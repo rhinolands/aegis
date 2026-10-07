@@ -2,6 +2,12 @@
 
 Notable changes per release, newest first. Written for someone deciding whether to upgrade.
 
+## Unreleased
+
+### Demo
+
+- **Step 8, an injected instruction.** `scripts/demo.sh` now registers a second agent that may only read tickets and has it handle a ticket carrying an injected instruction to mail the data out. The call to the mail tool is denied and recorded, because the tool is not on the agent's allowlist. The step then shows the limit: after the operator grants the mail tool, the same sequence is allowed and only recorded. The gateway decides per call on tool, peer and model. It has no rule on call arguments or on sequences of calls. No gateway code changed.
+
 ## v0.1.1 (2026-10-05)
 
 An audit-integrity release. Upgrade if you rely on chain verification.
