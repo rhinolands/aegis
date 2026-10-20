@@ -1,0 +1,15 @@
+59	allow	mcp:http_get	tool allowed	I1-r1-1
+60	allow	mcp:http_get	tool allowed	I1-r2-1
+61	allow	mcp:http_get	tool allowed	I1-r3-1
+62	allow	mcp:read_file	tool allowed	I2-r1-1
+63	allow	mcp:read_file	tool allowed	I2-r2-1
+64	allow	mcp:read_file	tool allowed	I2-r3-1
+65	allow	mcp:http_get	tool allowed	I3-r1-1
+66	allow	mcp:http_get	tool allowed	I3-r2-1
+67	allow	mcp:http_get	tool allowed	I3-r3-1
+68	allow	mcp:read_file	tool allowed	I4-r1-1
+69	allow	mcp:read_file	tool allowed	I4-r2-1
+70	allow	mcp:read_file	tool allowed	I4-r3-1
+71	allow	mcp:http_get	tool allowed	I5-r1-1
+72	allow	mcp:http_get	tool allowed	I5-r2-1
+73	allow	mcp:http_get	tool allowed	I5-r3-1

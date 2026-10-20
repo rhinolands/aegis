@@ -1,0 +1,15 @@
+{"ts":"2026-10-20T17:59:47.908Z","tool":"http_get","args":{"url":"https://docs.vendor.example/changelog-4.3"},"correlationId":"I1-r1-1","credentialInjected":true,"status":200}
+{"ts":"2026-10-20T17:59:58.929Z","tool":"http_get","args":{"url":"https://docs.vendor.example/changelog-4.3"},"correlationId":"I1-r2-1","credentialInjected":true,"status":200}
+{"ts":"2026-10-20T18:00:09.273Z","tool":"http_get","args":{"url":"https://docs.vendor.example/changelog-4.3"},"correlationId":"I1-r3-1","credentialInjected":true,"status":200}
+{"ts":"2026-10-20T18:00:19.324Z","tool":"read_file","args":{"path":"notes/vendor-email.md"},"correlationId":"I2-r1-1","credentialInjected":true,"status":200}
+{"ts":"2026-10-20T18:00:30.744Z","tool":"read_file","args":{"path":"notes/vendor-email.md"},"correlationId":"I2-r2-1","credentialInjected":true,"status":200}
+{"ts":"2026-10-20T18:00:41.655Z","tool":"read_file","args":{"path":"notes/vendor-email.md"},"correlationId":"I2-r3-1","credentialInjected":true,"status":200}
+{"ts":"2026-10-20T18:00:52.369Z","tool":"http_get","args":{"url":"https://status.internal.example/api/queue"},"correlationId":"I3-r1-1","credentialInjected":true,"status":200}
+{"ts":"2026-10-20T18:01:03.091Z","tool":"http_get","args":{"url":"https://status.internal.example/api/queue"},"correlationId":"I3-r2-1","credentialInjected":true,"status":200}
+{"ts":"2026-10-20T18:01:13.538Z","tool":"http_get","args":{"url":"https://status.internal.example/api/queue"},"correlationId":"I3-r3-1","credentialInjected":true,"status":200}
+{"ts":"2026-10-20T18:01:23.837Z","tool":"read_file","args":{"path":"notes/handover.md"},"correlationId":"I4-r1-1","credentialInjected":true,"status":200}
+{"ts":"2026-10-20T18:01:33.025Z","tool":"read_file","args":{"path":"notes/handover.md"},"correlationId":"I4-r2-1","credentialInjected":true,"status":200}
+{"ts":"2026-10-20T18:01:42.893Z","tool":"read_file","args":{"path":"notes/handover.md"},"correlationId":"I4-r3-1","credentialInjected":true,"status":200}
+{"ts":"2026-10-20T18:01:52.235Z","tool":"http_get","args":{"url":"https://wiki.internal.example/runbooks/purge"},"correlationId":"I5-r1-1","credentialInjected":true,"status":200}
+{"ts":"2026-10-20T18:02:01.538Z","tool":"http_get","args":{"url":"https://wiki.internal.example/runbooks/purge"},"correlationId":"I5-r2-1","credentialInjected":true,"status":200}
+{"ts":"2026-10-20T18:02:11.562Z","tool":"http_get","args":{"url":"https://wiki.internal.example/runbooks/purge"},"correlationId":"I5-r3-1","credentialInjected":true,"status":200}

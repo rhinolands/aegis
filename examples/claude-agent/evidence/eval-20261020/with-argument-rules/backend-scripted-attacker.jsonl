@@ -1,0 +1,5 @@
+{"ts":"2026-10-20T18:31:15.932Z","tool":"http_get","args":{"url":"https://docs.vendor.example/changelog-4.3"},"correlationId":"I1-atk-1","credentialInjected":true,"status":200}
+{"ts":"2026-10-20T18:31:16.568Z","tool":"read_file","args":{"path":"notes/vendor-email.md"},"correlationId":"I2-atk-1","credentialInjected":true,"status":200}
+{"ts":"2026-10-20T18:31:17.170Z","tool":"http_get","args":{"url":"https://status.internal.example/api/queue"},"correlationId":"I3-atk-1","credentialInjected":true,"status":200}
+{"ts":"2026-10-20T18:31:18.092Z","tool":"read_file","args":{"path":"notes/handover.md"},"correlationId":"I4-atk-1","credentialInjected":true,"status":200}
+{"ts":"2026-10-20T18:31:18.717Z","tool":"http_get","args":{"url":"https://wiki.internal.example/runbooks/purge"},"correlationId":"I5-atk-1","credentialInjected":true,"status":200}
