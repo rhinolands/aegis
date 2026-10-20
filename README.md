@@ -6,6 +6,10 @@ Apache-2.0. Self-hostable: one TypeScript service + Postgres.
 
 **Threat model:** [THREAT_MODEL.md](THREAT_MODEL.md) maps these controls to the OWASP LLM Top 10, MITRE ATLAS and the agentic threat model, with explicit non-goals.
 
+https://github.com/user-attachments/assets/8ec84c98-3711-430c-ada6-44f1aa160810
+
+*aegis governing a live Claude agent (Claude Agent SDK, Sonnet 5.5), a real run of `./examples/claude-agent/demo-live.sh`, about 30 seconds. The agent reads the runbook and checks status (both allowed), asks for the `db-admin` credential (denied, never executed), then the audit join and a passing chain verification. Rendered from the captured terminal output of that run, not a screen recording. See [Runs against a live Claude agent](#runs-against-a-live-claude-agent).*
+
 https://github.com/user-attachments/assets/936caf11-628e-4af6-8ab3-52acd3206297
 
 *A real run of `bash scripts/demo.sh`, all eight steps, about 70 seconds. An allowed call and a denied call. A tampered record, a deleted record and a hidden operator change, each caught by the audit chain. Then an injected instruction: refused while the agent was never given the tool, and allowed once the operator grants it, which the demo shows on purpose. Rendered from the captured output of that run, with pauses added for reading. Run it yourself with the same command.*
@@ -290,13 +294,7 @@ carries its own correlation id, which aegis stores in the audit record and
 relays to the backend, so the agent's request, the aegis decision and the
 backend execution join exactly.
 
-https://github.com/user-attachments/assets/8ec84c98-3711-430c-ada6-44f1aa160810
-
-*A real run of `./examples/claude-agent/demo-live.sh`: the agent reads the
-runbook and checks status (both allowed), asks for the `db-admin` credential
-(denied, never executed), then the audit join and a passing chain
-verification. Rendered from the captured terminal output of that run
-(`examples/claude-agent/evidence/demo/capture.jsonl`), not a screen recording.*
+A recording of one real run is at the top of this README.
 
 ```bash
 cd examples/claude-agent && npm install
