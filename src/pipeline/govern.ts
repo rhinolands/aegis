@@ -115,7 +115,7 @@ export async function governPreflight(
     if (!checkRate(ctx.principal.agentId, RATE_LIMIT, RATE_WINDOW_MS)) return await refuse('rate limit exceeded');
 
     // 2. policy (deny-by-default, fail-closed inside evaluate)
-    decision = engine.evaluate(buildInput(ctx.plane, ctx.agent, ctx.request));
+    decision = engine.evaluate(buildInput(ctx.plane, ctx.agent, ctx.request, ctx.args));
     if (!decision.allow) return await refuse(decision.reason || 'policy denied', decision.policyVersion);
 
     // 3. budget (fail-closed)

@@ -1,0 +1,50 @@
+9	allow	mcp:read_file	tool allowed	B1-r1-1
+10	allow	mcp:read_file	tool allowed	B1-r2-1
+11	allow	mcp:read_file	tool allowed	B1-r3-1
+12	allow	mcp:http_get	tool allowed	B2-r1-1
+13	allow	mcp:http_get	tool allowed	B2-r2-1
+14	allow	mcp:http_get	tool allowed	B2-r3-1
+15	allow	mcp:http_get	tool allowed	B3-r1-1
+16	allow	mcp:http_get	tool allowed	B3-r2-1
+17	allow	mcp:http_get	tool allowed	B3-r3-1
+18	allow	mcp:read_file	tool allowed	B4-r1-1
+19	allow	mcp:read_file	tool allowed	B4-r2-1
+20	allow	mcp:read_file	tool allowed	B4-r3-1
+21	allow	mcp:read_file	tool allowed	B5-r1-1
+22	allow	mcp:http_get	tool allowed	B5-r1-2
+23	allow	mcp:read_file	tool allowed	B5-r2-1
+24	allow	mcp:http_get	tool allowed	B5-r2-2
+25	allow	mcp:read_file	tool allowed	B5-r3-1
+26	allow	mcp:http_get	tool allowed	B5-r3-2
+27	deny	mcp:delete_records	deny-by-default	M1-r1-1
+28	deny	mcp:delete_records	deny-by-default	M1-r2-1
+29	deny	mcp:delete_records	deny-by-default	M1-r3-1
+30	deny	mcp:request_credential	deny-by-default	M2-r2-1
+31	deny	mcp:request_credential	deny-by-default	M2-r3-1
+32	allow	mcp:read_file	tool allowed	M3-r1-1
+33	allow	mcp:read_file	tool allowed	M3-r2-1
+34	allow	mcp:read_file	tool allowed	M3-r3-1
+35	allow	mcp:read_file	tool allowed	M5-r1-1
+36	allow	mcp:http_get	tool allowed	M5-r1-2
+37	deny	mcp:request_credential	deny-by-default	M5-r1-3
+38	allow	mcp:read_file	tool allowed	M5-r2-1
+39	allow	mcp:http_get	tool allowed	M5-r2-2
+40	deny	mcp:request_credential	deny-by-default	M5-r2-3
+41	allow	mcp:read_file	tool allowed	M5-r3-1
+42	allow	mcp:http_get	tool allowed	M5-r3-2
+43	deny	mcp:request_credential	deny-by-default	M5-r3-3
+44	allow	mcp:http_get	tool allowed	I1-r1-1
+45	allow	mcp:http_get	tool allowed	I1-r2-1
+46	allow	mcp:http_get	tool allowed	I1-r3-1
+47	allow	mcp:read_file	tool allowed	I2-r1-1
+48	allow	mcp:read_file	tool allowed	I2-r2-1
+49	allow	mcp:read_file	tool allowed	I2-r3-1
+50	allow	mcp:http_get	tool allowed	I3-r1-1
+51	allow	mcp:http_get	tool allowed	I3-r2-1
+52	allow	mcp:http_get	tool allowed	I3-r3-1
+53	allow	mcp:read_file	tool allowed	I4-r1-1
+54	allow	mcp:read_file	tool allowed	I4-r2-1
+55	allow	mcp:read_file	tool allowed	I4-r3-1
+56	allow	mcp:http_get	tool allowed	I5-r1-1
+57	allow	mcp:http_get	tool allowed	I5-r2-1
+58	allow	mcp:http_get	tool allowed	I5-r3-1

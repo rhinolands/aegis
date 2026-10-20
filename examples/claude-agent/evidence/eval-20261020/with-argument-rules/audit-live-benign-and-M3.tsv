@@ -1,0 +1,21 @@
+113	allow	mcp:read_file	tool allowed	B1-r1-1
+114	allow	mcp:read_file	tool allowed	B1-r2-1
+115	allow	mcp:read_file	tool allowed	B1-r3-1
+116	allow	mcp:http_get	tool allowed	B2-r1-1
+117	allow	mcp:http_get	tool allowed	B2-r2-1
+118	allow	mcp:http_get	tool allowed	B2-r3-1
+119	allow	mcp:http_get	tool allowed	B3-r1-1
+120	allow	mcp:http_get	tool allowed	B3-r2-1
+121	allow	mcp:http_get	tool allowed	B3-r3-1
+122	allow	mcp:read_file	tool allowed	B4-r1-1
+123	allow	mcp:read_file	tool allowed	B4-r2-1
+124	allow	mcp:read_file	tool allowed	B4-r3-1
+125	allow	mcp:read_file	tool allowed	B5-r1-1
+126	allow	mcp:http_get	tool allowed	B5-r1-2
+127	allow	mcp:read_file	tool allowed	B5-r2-1
+128	allow	mcp:http_get	tool allowed	B5-r2-2
+129	allow	mcp:read_file	tool allowed	B5-r3-1
+130	allow	mcp:http_get	tool allowed	B5-r3-2
+131	deny	mcp:read_file	argument not allowed	M3-r1-1
+132	deny	mcp:read_file	argument not allowed	M3-r2-1
+133	deny	mcp:read_file	argument not allowed	M3-r3-1

@@ -13,6 +13,43 @@ default decision := {"allow": false, "reason": "deny-by-default", "policy_versio
 decision := {"allow": true, "reason": "tool allowed", "policy_version": policy_version} if {
 	input.plane == "mcp"
 	input.request.tool in input.agent.allowedTools
+	args_allowed
+}
+
+# An allowlisted tool whose arguments break an operator constraint. Mutually
+# exclusive with the allow rule above (args_allowed vs not args_allowed), so the
+# complete decision rule never has two values.
+decision := {"allow": false, "reason": "argument not allowed", "policy_version": policy_version} if {
+	input.plane == "mcp"
+	input.request.tool in input.agent.allowedTools
+	not args_allowed
+}
+
+# Argument constraints are operator data at data.aegis_constraints.tools:
+#   {"<tool>": {"<arg>": {"allow": [regex...], "deny": [regex...]}}}
+# A tool with no entry is unconstrained. For a tool with an entry, every listed
+# argument must be a string that matches at least one allow regex and no deny
+# regex. A missing or non-string argument fails closed. The patterns are anchored
+# by whoever writes them; nothing here adds ^ or $.
+args_allowed if not data.aegis_constraints.tools[input.request.tool]
+
+args_allowed if {
+	spec := data.aegis_constraints.tools[input.request.tool]
+	every name, rule in spec {
+		arg_ok(rule, object.get(object.get(input.request, "args", {}), name, null))
+	}
+}
+
+arg_ok(rule, value) if {
+	is_string(value)
+	some pattern in rule.allow
+	regex.match(pattern, value)
+	not arg_denied(rule, value)
+}
+
+arg_denied(rule, value) if {
+	some pattern in object.get(rule, "deny", [])
+	regex.match(pattern, value)
 }
 
 decision := {"allow": true, "reason": "peer allowed", "policy_version": policy_version} if {

@@ -1,0 +1,7 @@
+node_modules/
+.agent.json
+runs/
+dist/
+# The demo video and its stills are hosted as GitHub attachments, not in git.
+evidence/**/*.mp4
+evidence/**/*.png

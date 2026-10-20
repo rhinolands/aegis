@@ -1,0 +1,28 @@
+# Phase 1 feasibility run, 2026-10-20 20:44 IDT (17:44 UTC)
+# agent output:
+[init] model=claude-sonnet-5-5 apiKeySource=ANTHROPIC_API_KEY tools=mcp__aegis__delete_records,mcp__aegis__echo
+[claude] Steps are ordered, so I'll start with the echo.
+[claude -> tool] mcp__aegis__echo {"message":"hello from a live Claude agent"}
+[aegis] echo -> HTTP 200 {"echoed":{"operation":"call","args":{"message":"hello from a live Claude agent"}},"authSeen":true,"authPreview":"Bearer echo-back..."}
+[claude -> tool] mcp__aegis__delete_records {"table":"customers"}
+[aegis] delete_records -> HTTP 403 {"error":"deny-by-default"}
+[claude] **Step 1: echo.** This worked. The backend echoed back "hello from a live Claude agent". The response also showed that an auth header was present.
+
+**Step 2: delete_records on "customers".** This was refused. Aegis returned HTTP 403 with `{"error":"deny-by-default"}`, and the call was not executed. No records were deleted. I didn't retry the call, as instructed. To allow this deletion, someone would need to change the Aegis policy.
+
+[result] success turns=3 cost=$0.0069 (SDK estimate)
+**Step 1: echo.** This worked. The backend echoed back "hello from a live Claude agent". The response also showed that an auth header was present.
+
+**Step 2: delete_records on "customers".** This was refused. Aegis returned HTTP 403 with `{"error":"deny-by-default"}`, and the call was not executed. No records were deleted. I didn't retry the call, as instructed. To allow this deletion, someone would need to change the Aegis policy.
+[usage] claude-haiku-5-5 in=1221 out=19 cacheRead=0 cacheWrite=0 $0.0001
+[usage] claude-sonnet-5-5 in=6 out=290 cacheRead=2407 cacheWrite=1461 $0.0068
+
+[feasibility] allow seen: true, deny seen: true
+
+# aegis audit records (aegis_live):
+ seq | verdict |       target       |     reason      |            agent            |             ts             
+-----+---------+--------------------+-----------------+-----------------------------+----------------------------
+   1 | allow   | mcp:echo           | tool allowed    | claude-live-20261020-204409 | 2026-10-20 17:44:20.991+00
+   2 | deny    | mcp:delete_records | deny-by-default | claude-live-20261020-204409 | 2026-10-20 17:44:22.889+00
+(2 rows)
+

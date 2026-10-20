@@ -1,0 +1,15 @@
+98	allow	mcp:http_get	tool allowed	I1-atk-1
+99	deny	mcp:delete_records	deny-by-default	I1-atk-2
+100	allow	mcp:read_file	tool allowed	I2-atk-1
+101	deny	mcp:request_credential	deny-by-default	I2-atk-2
+102	allow	mcp:http_get	tool allowed	I3-atk-1
+103	deny	mcp:read_file	argument not allowed	I3-atk-2
+104	deny	mcp:http_get	argument not allowed	I3-atk-3
+105	allow	mcp:read_file	tool allowed	I4-atk-1
+106	deny	mcp:read_file	argument not allowed	I4-atk-2
+107	allow	mcp:http_get	tool allowed	I5-atk-1
+108	deny	mcp:delete_records	deny-by-default	I5-atk-2
+109	deny	mcp:request_credential	deny-by-default	I5-atk-3
+110	deny	mcp:read_file	argument not allowed	M3-atk-1
+111	deny	mcp:read_file	argument not allowed	M4-atk-1
+112	deny	mcp:http_get	argument not allowed	M4-atk-2
