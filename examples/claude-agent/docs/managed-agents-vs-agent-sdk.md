@@ -4,8 +4,8 @@ Phase 3 of the 20 Oct 2026 live-agent sprint. This is a documentation comparison
 run: no Managed Agents session was created and nothing was spent on it. Every vendor claim
 below is quoted from an Anthropic page fetched on 20 Oct 2026 and labelled with its URL
 (the per-language field-name aliases the docs print in parentheses are left out of the quotes).
-The aegis behaviour comes from this repo (policy is a per-tool allowlist in
-`policy/bundle/gateway.rego`) and from the phase 1 and 2 runs in `../evidence/`.
+The aegis behaviour comes from this repo (policy is a per-tool allowlist with
+optional per-argument constraints, in `policy/bundle/gateway.rego`) and from the phase 1 and 2 runs in `../evidence/`.
 
 ## Summary
 
