@@ -290,11 +290,13 @@ carries its own correlation id, which aegis stores in the audit record and
 relays to the backend, so the agent's request, the aegis decision and the
 backend execution join exactly.
 
-A recording of one real run (rendered from the captured terminal output, not a
-screen recording) is in `examples/claude-agent/evidence/demo/aegis-live-claude-demo.mp4`:
-the agent reads the runbook and checks status (both allowed), asks for the
-`db-admin` credential (denied, never executed), then the audit join and a
-passing chain verification.
+https://github.com/user-attachments/assets/VIDEO-UPLOAD-PENDING-replace-before-push
+
+*A real run of `./examples/claude-agent/demo-live.sh`: the agent reads the
+runbook and checks status (both allowed), asks for the `db-admin` credential
+(denied, never executed), then the audit join and a passing chain
+verification. Rendered from the captured terminal output of that run
+(`examples/claude-agent/evidence/demo/capture.jsonl`), not a screen recording.*
 
 ```bash
 cd examples/claude-agent && npm install
