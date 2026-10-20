@@ -7,6 +7,7 @@ Notable changes per release, newest first. Written for someone deciding whether 
 ### Added
 
 - **MCP argument constraints.** Operators can constrain the arguments of an allowlisted MCP tool with rules at `data.aegis_constraints.tools` (per tool, per argument, allow and deny regexes). A constrained argument that is missing, not a string, matches no allow pattern or matches a deny pattern is refused with reason `argument not allowed`. The policy reads a JSON-safe copy of the arguments in memory, and the audit record still stores only their digest. The shipped bundle has no constraints, so behaviour is unchanged until an operator adds them. Constraints apply per tool name to every agent, not per agent.
+- **`examples/claude-agent/`.** A Claude Agent SDK agent whose every tool call goes through aegis, with a rule-graded eval (live agent, an agent told to obey injected text, and a scripted attacker with no model). See "Runs against a live Claude agent" in the README.
 
 ### Demo
 
