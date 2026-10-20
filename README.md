@@ -93,7 +93,7 @@ The tests show each of the three owner rewrites passing the in-database check an
 
 Verified by `npm test` (180 passing across 25 test files as of v0.1+G, plus the
 S3 export integration test, which reports a real vitest **skip** unless
-`RUN_S3_INTEGRATION=1`) and `opa test policy/bundle` (9 passing). The suite grows
+`RUN_S3_INTEGRATION=1`) and `opa test policy/bundle` (19 passing). The suite grows
 as features land — run `npm test` for the current count.
 
 **Complete and tested**
@@ -109,6 +109,7 @@ as features land — run `npm test` for the current count.
 - Operator changes recorded in the audit chain: registration, allowlists, credentials and destinations, budgets. Each config write and its record commit in one transaction, proven by tests that fail the audit append and check the configuration did not change
 - Verification against an exported manifest (`npm run verify -- --manifest <path>`), offline from a local copy of the export, proven against consistent owner-level rewrites that the in-database check cannot see
 - OPA/Rego policy bundle — deny-by-default, tool/peer/model allowlists, compiled to WASM (`opa build -t wasm`)
+- MCP argument constraints — operator rules at `data.aegis_constraints.tools` (per tool, per argument: allow and deny regexes). An allowlisted tool whose constrained argument is missing, not a string, matches no allow pattern or matches a deny pattern is refused with reason `argument not allowed`. The policy reads a JSON-safe copy of the arguments in memory. The audit record still stores only the digest. The product bundle ships with no constraints, so behaviour is unchanged until an operator adds them. Constraints are per tool name for every agent, not per agent yet
 - In-process OPA evaluation with a fail-closed wrapper
 
 - Scoped backend credential store — secrets encrypted at rest, scoped by `(agentId, target)`, with agent isolation explicitly tested
@@ -172,7 +173,7 @@ export AUDIT_MASTER_KEY=$(head -c32 /dev/zero | base64)   # dev only
 npx drizzle-kit migrate     # includes the append-only grants + trigger
 npm run build               # compiles the Rego policy to WASM, then TypeScript
 npm test                    # unit + integration suite
-opa test policy/bundle -v   # 9 policy tests
+opa test policy/bundle -v   # 19 policy tests
 ```
 
 The S3 export integration test only runs when `RUN_S3_INTEGRATION=1` is set
@@ -256,9 +257,10 @@ starts (or reuses) the echo upstream and the gateway itself, then walks through:
    tickets handles one that tells it to mail the data out. It was never given a
    mail tool → `403`, deny logged. Then the limit, on purpose: the operator
    grants the mail tool, the same two calls run again, and both are **allowed**.
-   The gateway does not detect the injection. It decides per call on tool, peer
-   and model, with no rule on call arguments or on sequences of calls, so the
-   grant is the security decision and the chain records who made it. No model
+   The gateway does not detect the injection. The demo runs the shipped policy
+   bundle, which decides per call on tool, peer and model and carries no
+   argument constraints and no rule on sequences of calls, so the grant is the
+   security decision and the chain records who made it. No model
    runs in this step: the script plays an agent that obeyed the injected text.
 
 ```bash

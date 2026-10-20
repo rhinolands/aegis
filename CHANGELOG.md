@@ -4,6 +4,10 @@ Notable changes per release, newest first. Written for someone deciding whether 
 
 ## Unreleased
 
+### Added
+
+- **MCP argument constraints.** Operators can constrain the arguments of an allowlisted MCP tool with rules at `data.aegis_constraints.tools` (per tool, per argument, allow and deny regexes). A constrained argument that is missing, not a string, matches no allow pattern or matches a deny pattern is refused with reason `argument not allowed`. The policy reads a JSON-safe copy of the arguments in memory, and the audit record still stores only their digest. The shipped bundle has no constraints, so behaviour is unchanged until an operator adds them. Constraints apply per tool name to every agent, not per agent.
+
 ### Demo
 
 - **Step 8, an injected instruction.** `scripts/demo.sh` now registers a second agent that may only read tickets and has it handle a ticket carrying an injected instruction to mail the data out. The call to the mail tool is denied and recorded, because the tool is not on the agent's allowlist. The step then shows the limit: after the operator grants the mail tool, the same sequence is allowed and only recorded. The gateway decides per call on tool, peer and model. It has no rule on call arguments or on sequences of calls. No gateway code changed.
