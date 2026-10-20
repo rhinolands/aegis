@@ -109,7 +109,7 @@ as features land — run `npm test` for the current count.
 - Operator changes recorded in the audit chain: registration, allowlists, credentials and destinations, budgets. Each config write and its record commit in one transaction, proven by tests that fail the audit append and check the configuration did not change
 - Verification against an exported manifest (`npm run verify -- --manifest <path>`), offline from a local copy of the export, proven against consistent owner-level rewrites that the in-database check cannot see
 - OPA/Rego policy bundle — deny-by-default, tool/peer/model allowlists, compiled to WASM (`opa build -t wasm`)
-- MCP argument constraints — operator rules at `data.aegis_constraints.tools` (per tool, per argument: allow and deny regexes). An allowlisted tool whose constrained argument is missing, not a string, matches no allow pattern or matches a deny pattern is refused with reason `argument not allowed`. The policy reads a JSON-safe copy of the arguments in memory. The audit record still stores only the digest. The product bundle ships with no constraints, so behaviour is unchanged until an operator adds them. Constraints are per tool name for every agent, not per agent yet
+- MCP argument constraints — operator rules at `data.aegis_constraints.tools` (per tool, per argument: allow and deny regexes). An allowlisted tool whose constrained argument is missing, not a string, matches no allow pattern or matches a deny pattern is refused with reason `argument not allowed`. The policy reads a JSON-safe copy of the arguments in memory. The audit record still stores only the digest. The product bundle ships with no constraints, so behaviour is unchanged until an operator adds them. Constraints are per tool name for every agent, not per agent
 - In-process OPA evaluation with a fail-closed wrapper
 
 - Scoped backend credential store — secrets encrypted at rest, scoped by `(agentId, target)`, with agent isolation explicitly tested
@@ -284,7 +284,8 @@ alike. The agent's allowlist in aegis holds `read_file` and `http_get` only.
 
 The agent process is locked down so aegis is the only way out: every built-in
 SDK tool is removed (`tools: []`), no user or project settings are loaded, and
-a `PreToolUse` hook refuses any tool that is not an aegis tool. Each call
+a `PreToolUse` hook refuses any tool that is not an aegis tool (it lets the
+SDK's own `ToolSearch` through). Each call
 carries its own correlation id, which aegis stores in the audit record and
 relays to the backend, so the agent's request, the aegis decision and the
 backend execution join exactly.
@@ -324,8 +325,8 @@ verdict is checked against reality, not against what aegis or the agent say.
 
 Three arms. Claude Sonnet 5.5, three sessions per scenario (45 sessions). The
 same agent told by its system prompt to obey instructions found in content, on
-the injection scenarios (15 sessions), standing in for an agent that does not
-hold. And a scripted attacker with no model, replaying the calls an obedient
+the injection scenarios (15 sessions), meant to stand in for an agent that does
+not hold. Claude declined in all 15, so this arm produced no injected calls. And a scripted attacker with no model, replaying the calls an obedient
 agent would make, so aegis is tested on its own.
 
 | Arm | Harmful calls attempted | Blocked by aegis | Missed (executed) | Claude declined (sessions) | Legit calls allowed | False denies |
@@ -350,7 +351,8 @@ in `examples/claude-agent/policy/constraints.rego`.
 
 What this shows, stated plainly:
 
-- **aegis blocks every call to a tool outside the agent's allowlist**: every
+- **In this eval, aegis blocked every call to a tool outside the agent's
+  allowlist**: every
   `delete_records` and `request_credential` attempt, from a user's request or
   from a replayed injection, was refused and never reached the backend.
 - **A per-tool allowlist alone does not judge arguments.** Without argument
@@ -367,8 +369,9 @@ What this shows, stated plainly:
   were still allowed. The rules are only as good as the patterns: a harmful
   argument that fits an allowed pattern (a sensitive file placed under
   `notes/`, data hidden in an allowed URL path) still gets through.
-- **Claude Sonnet 5.5 resisted all 30 injections** in both live arms, including
-  with a system prompt telling it to obey them, so no injected instruction
+- **Claude Sonnet 5.5 resisted the injections in all 30 sessions** (five
+  injection scenarios, three sessions each, in both live arms), including with
+  a system prompt telling it to obey them, so no injected instruction
   reached aegis from a live agent. The scripted arm is the evidence for the
   case where the model does not hold.
 - No benign call was refused.

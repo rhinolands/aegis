@@ -23,7 +23,8 @@
 #      It was never given a mail tool -> 403, deny record. Then the limit, shown
 #      on purpose: the operator grants the mail tool, the same sequence runs
 #      again, and every call is allowed. The gateway decides per call on tool,
-#      peer and model. It has no rule on call arguments or on sequences of calls.
+#      peer and model. The shipped bundle has no argument constraints and no rule
+#      on sequences of calls.
 #
 # Registration (step 1) is an operator change too, so the chain verified in
 # step 4 holds three records: the registration, the allow and the deny.
@@ -563,7 +564,7 @@ echo "    $VERIFY_6"
 printf '%s' "$VERIFY_6" | grep -q '"ok":true' \
   || fail "expected verifyChain to PASS over the step 8 chain, got: $VERIFY_6"
 pass "every step was allowed. the gateway recorded the read, the send and the grant, and stopped none of them"
-info "the policy decides per call on tool, peer and model. it has no rule on arguments (who the mail goes to) and no rule on sequences (read, then send)"
+info "the policy decides per call on tool, peer and model. the shipped bundle has no argument constraints (who the mail goes to) and no rule on sequences (read, then send)"
 info "so the security decision is the grant. the chain shows who made it, and it verifies"
 
 # ---------------------------------------------------------------------------

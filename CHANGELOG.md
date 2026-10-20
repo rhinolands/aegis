@@ -11,7 +11,7 @@ Notable changes per release, newest first. Written for someone deciding whether 
 
 ### Demo
 
-- **Step 8, an injected instruction.** `scripts/demo.sh` now registers a second agent that may only read tickets and has it handle a ticket carrying an injected instruction to mail the data out. The call to the mail tool is denied and recorded, because the tool is not on the agent's allowlist. The step then shows the limit: after the operator grants the mail tool, the same sequence is allowed and only recorded. The gateway decides per call on tool, peer and model. It has no rule on call arguments or on sequences of calls. No gateway code changed.
+- **Step 8, an injected instruction.** `scripts/demo.sh` now registers a second agent that may only read tickets and has it handle a ticket carrying an injected instruction to mail the data out. The call to the mail tool is denied and recorded, because the tool is not on the agent's allowlist. The step then shows the limit: after the operator grants the mail tool, the same sequence is allowed and only recorded. The gateway decides per call on tool, peer and model. The demo runs the shipped policy bundle, which has no argument constraints and no rule on sequences of calls. No gateway code changed.
 
 ## v0.1.1 (2026-10-05)
 
