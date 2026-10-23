@@ -29,6 +29,8 @@ jobs:
       # S3 store is unreachable when this is set, the test FAILS rather than
       # silently skipping (see test/audit-export.test.ts).
       RUN_S3_INTEGRATION: "1"
+      # Pinned so a new OPA release cannot change policy results under CI.
+      OPA_VERSION: v1.10.1
       EXPORT_S3_ENDPOINT: http://localhost:9000
       EXPORT_S3_BUCKET: aegis-audit
       EXPORT_S3_ACCESS_KEY: aegis
@@ -83,7 +85,7 @@ jobs:
 
       - name: install opa
         run: |
-          curl -L -o /usr/local/bin/opa https://openpolicyagent.org/downloads/latest/opa_linux_amd64_static
+          sudo curl -fsSL -o /usr/local/bin/opa "https://github.com/open-policy-agent/opa/releases/download/${OPA_VERSION}/opa_linux_amd64_static"
           sudo chmod +x /usr/local/bin/opa
           opa version
 
@@ -102,6 +104,34 @@ jobs:
 
       - name: test (vitest, serial — shared Postgres + hash chain)
         run: npm test
+
+  lint:
+    runs-on: ubuntu-latest
+    env:
+      OPA_VERSION: v1.10.1
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: install opa
+        run: |
+          sudo curl -fsSL -o /usr/local/bin/opa "https://github.com/open-policy-agent/opa/releases/download/${OPA_VERSION}/opa_linux_amd64_static"
+          sudo chmod +x /usr/local/bin/opa
+
+      - run: npm ci
+
+      - name: eslint (src, test, scripts)
+        run: npm run lint
+
+      - name: opa fmt (fails on unformatted policy)
+        run: opa fmt --fail --list policy examples/claude-agent/policy
+
+      - name: opa check --strict
+        run: opa check --strict policy/bundle examples/claude-agent/policy
 
   gitleaks:
     runs-on: ubuntu-latest

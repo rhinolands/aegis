@@ -1,4 +1,4 @@
-import { pgTable, uuid, text, timestamp, jsonb, bigint, boolean, integer } from 'drizzle-orm/pg-core';
+import { pgTable, uuid, text, timestamp, jsonb, bigint, boolean } from 'drizzle-orm/pg-core';
 
 // Registered agent identities (app-only; never a user)
 export const agents = pgTable('agents', {
