@@ -54,22 +54,23 @@ import { log } from '../log.js';
 const OPERATION = 'messages.create';
 
 /**
- * Generic, Acme-safe refusal copy. Deliberately says nothing about WHICH
+ * Generic, consumer-safe refusal copy. Deliberately says nothing about WHICH
  * control refused — that distinction travels in the machine-readable code
  * below, never in prose a user might read.
  */
 const DENIAL_MESSAGE = 'Request denied by the governance gateway.';
 
 /**
- * The published gateway_code vocabulary (D-09). This is a CONTRACT with Acme:
- * Acme switches on `err.error.error.gateway_code` and renders its own copy.
+ * The published gateway_code vocabulary (D-09). This is a contract with every
+ * consumer: a consumer switches on `err.error.error.gateway_code` and renders
+ * its own copy.
  *
  * The streaming-refusal member is deliberately RETAINED after plan 45-07 (G2)
  * replaced plan 45-05's P-06 refusal with the real passthrough. No code path
  * emits it on the normal streaming flow any more, but the published vocabulary
- * is a contract Acme already switches on, and a future path that has to refuse
+ * is a contract consumers may already switch on, and a future path that has to refuse
  * a streamed body (an upstream style that cannot stream, a kill switch) should
- * still have a defined, Acme-safe way to say so rather than inventing one.
+ * still have a defined, consumer-safe way to say so rather than inventing one.
  */
 type GatewayCode =
   | 'model_not_allowed'
@@ -94,8 +95,8 @@ type GatewayCode =
  *
  * D-09 RULE: Aegis's internal vocabulary must NEVER appear in the response.
  * The Anthropic SDK stuffs the whole error body into `err.message` when the
- * body has no top-level `message` field (core/error.js:18-35), and Acme
- * renders that string into user-facing copy — so a raw 'deny-by-default'
+ * body has no top-level `message` field (core/error.js:18-35), and a consumer
+ * may render that string into user-facing copy — so a raw 'deny-by-default'
  * would land in front of a customer. That is why this is one explicit,
  * exhaustive function with an unknown_denial default, and not a string match
  * sprinkled through the handler: a new internal reason degrades to a safe
@@ -193,13 +194,13 @@ export function registerLlmRawPlane(app: FastifyInstance, deps: ServerDeps): voi
     // One Fastify route serves BOTH /v1/messages and /v1/messages?beta=true:
     // a query string does not affect route matching. req.query.beta is read
     // only to decide whether to append it upstream, never to reject a request
-    // for its absence — the advisor lane never sends it.
+    // for its absence — a consumer may never send it.
     //
     // P-08: 8 MiB, a per-ROUTE option (Fastify's route bodyLimit overrides the
-    // parser's — lib/route.js:382). Fastify's default is 1 MiB, and Acme's
-    // assessment sends the WAF prompt plus the full blueprint JSON plus the
-    // cost table plus the ALZ findings in one content string; a 413 there
-    // would look like a gateway bug. Still bounded, deliberately.
+    // parser's — lib/route.js:382). Fastify's default is 1 MiB, and a
+    // consumer that packs a long prompt plus large structured documents into
+    // one content string can exceed it; a 413 there would look like a gateway
+    // bug. Still bounded, deliberately.
     scope.post('/v1/messages', { bodyLimit: 8388608 }, handler);
     done();
   });
@@ -332,8 +333,8 @@ export function registerLlmRawPlane(app: FastifyInstance, deps: ServerDeps): voi
         .send(anthropicError('api_error', 'The upstream model provider attempted a redirect, which is refused.', 'upstream_redirect'));
     }
 
-    // The upstream request id is the join key Phase 47's audit correlation
-    // will want between an Acme-side record and the real Anthropic call.
+    // The upstream request id is the join key audit correlation needs
+    // between a consumer-side record and the real Anthropic call.
     const requestId = upstream.headers.get('request-id');
     if (requestId) reply.header('request-id', requestId);
 
@@ -358,7 +359,7 @@ export function registerLlmRawPlane(app: FastifyInstance, deps: ServerDeps): voi
     // escape hatch either — it reaches the SDK as an UNTYPED APIError with
     // status undefined (core/streaming.js:113-118), so it can carry no typed
     // denial. A gateway that opens an SSE response and THEN fails therefore
-    // produces an opaque, unclassifiable Acme-side error.
+    // produces an opaque, unclassifiable consumer-side error.
     //
     // So the ordering is structural, not stylistic: governPreflight has already
     // run, the credential is already resolved, the upstream has already
@@ -444,11 +445,10 @@ export function registerLlmRawPlane(app: FastifyInstance, deps: ServerDeps): voi
         return settled;
       };
 
-      // Acme's own advisor route writes this exact header set before relaying
-      // SSE to the browser (apps/api/src/routes/blueprints/advisor.ts), and the
-      // relayed stream travels the same path. The accel-buffering header tells
-      // an intermediary proxy not to hold the stream back, which would destroy
-      // the token-by-token rendering the advisor lane exists for.
+      // This is the standard header set a consumer writes before relaying SSE
+      // to a browser, and the relayed stream travels the same path. The
+      // accel-buffering header tells an intermediary proxy not to hold the
+      // stream back, which would destroy token-by-token rendering.
       reply.raw.writeHead(200, {
         'content-type': upstream.headers.get('content-type') ?? 'text/event-stream',
         'cache-control': 'no-cache',

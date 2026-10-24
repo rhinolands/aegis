@@ -126,7 +126,7 @@ export interface ModelPrice {
 //
 //  DELETED, DO NOT RESTORE FROM GIT HISTORY: the previous table's two rows,
 //  'claude-sonnet-5': 3000 and 'claude-opus-4-8': 15000. They were
-//  self-declared [UNVERIFIED] placeholders, they are not models Acme sends,
+//  self-declared [UNVERIFIED] placeholders, they are not models in the price table,
 //  and they are wrong in this shape as well as the old one (against the same
 //  primary source, Sonnet 5 is $2/$10 introductory then $3/$15, and Opus 4.8
 //  is $5/$25 — neither is a single flat rate). Re-adding an unverified row

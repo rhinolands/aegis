@@ -80,7 +80,7 @@ export function registerMcpPlane(app: FastifyInstance, deps: ServerDeps): void {
         }
         const headers: Record<string, string> = { 'content-type': 'application/json' };
         headers['authorization'] = `Bearer ${registered.secret}`;
-        // G6 (Acme Phase 47 / AGW-08): relay the caller's correlation id to the
+        // G6: relay the caller's correlation id to the
         // operator-registered upstream so the backend's own audit row can be
         // joined to this gateway record. Server-authored from the SAME
         // normalized `correlationId` the govern context is built from, never

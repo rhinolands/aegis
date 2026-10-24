@@ -3,8 +3,8 @@
 // credential, and its budget limits. `scripts/register.ts` is INSERT-only and
 // `agents.name` is globally unique, so re-registering an existing agent is
 // impossible — without this CLI there is no way to change any of the above
-// short of hand-written SQL, and the three live Acme lane agents sit at
-// `allowed_models = []`, which denies every LLM call by deny-by-default.
+// short of hand-written SQL, and an agent registered with
+// `allowed_models = []` is denied every LLM call by deny-by-default.
 //
 // Usage:
 //   AEGIS_UPSTREAM_SECRET=... npx tsx scripts/update-agent.ts \
@@ -34,9 +34,9 @@
 //   It is a custody improvement, not a convenience: it lets a caller PIPE a
 //   freshly minted credential straight into this process without the value ever
 //   existing as a shell variable, a `$( … )` capture, a file, or an entry in the
-//   environment of a process an operator might later dump. That is the same
-//   discipline scripts/seed-aegis-identities.sh already uses for the register
-//   CLI's stdout. The read happens ONCE and the value covers every row the
+//   environment of a process an operator might later dump. A seeding script
+//   should apply the same discipline to the register CLI's stdout. The read
+//   happens ONCE and the value covers every row the
 //   invocation writes. A flag is still refused by construction: no case in
 //   parseArgs accepts a secret value.
 //
@@ -55,7 +55,7 @@
 //   clause, and `getCredentialTarget` resolves with `.limit(1)` and no
 //   `ORDER BY`. A duplicate row therefore makes it non-deterministic which
 //   credential the gateway actually uses: it could pick the garbage placeholder
-//   the seed script wrote instead of the real key. So this deletes every
+//   a seeding script wrote instead of the real key. So this deletes every
 //   existing row for the pair, inserts exactly one, and then asserts the count
 //   is 1 — refusing to report success on a state it cannot vouch for. The same
 //   sequence runs once PER TARGET, so writing N `mcp:<tool>` rows in a single
@@ -73,17 +73,17 @@
 //   separate validators and neither is relaxed to accommodate the other.
 //
 // HOW THE TOOLS ALLOWLIST IS MANAGED (--allow-tool).
-//   The column carried an ["acme-none"] placeholder on the live lane agents
-//   until this flag existed; register.ts is INSERT-only and `agents.name` is
-//   globally unique, so an existing lane agent could not be re-registered to
+//   An agent registered with a placeholder tools list could not change it
+//   before this flag existed; register.ts is INSERT-only and `agents.name` is
+//   globally unique, so an existing agent could not be re-registered to
 //   change it. --allow-tool now sets it, and like --allow-model it REPLACES the
 //   whole array from ONE invocation. That contract is the point: a seeding
 //   caller that looped, passing a single --allow-tool per run, would leave only
-//   the last name allowed and deny the rest — so pass every tool the lane needs
+//   the last name allowed and deny the rest — so pass every tool the agent needs
 //   as repeated flags on a single command.
 //
 //   There is deliberately NO price-gate twin for tools (see the validation
-//   block below for the full reasoning): Aegis has no Acme tool catalog, and
+//   block below for the full reasoning): Aegis has no consumer tool catalog, and
 //   inventing one here would be a second source of truth.
 //
 // EVERY WRITE IS AN OPERATOR RECORD IN THE AUDIT CHAIN.
@@ -112,7 +112,7 @@ export const LLM_TARGET = 'llm:anthropic';
 export const DEFAULT_UPSTREAM_ORIGIN = 'https://api.anthropic.com';
 
 export interface UpdateAgentOptions {
-  /** Globally-unique agent name, e.g. `acme-advisor-<acme-tenant-uuid>`. */
+  /** Globally-unique agent name, e.g. `support-bot-<tenant-uuid>`. */
   agentName: string;
   /** When present, REPLACES the allowlist with exactly this set. Absent = leave alone. */
   allowModels?: string[];
@@ -162,7 +162,7 @@ MODEL_PRICES entry or nothing is written. --set-credential replaces the
 the AEGIS_UPSTREAM_SECRET environment variable — never from a flag.
 
 --allow-tool is repeatable and likewise REPLACES the tools allowlist with
-exactly the supplied set. Pass every tool the lane needs in ONE invocation:
+exactly the supplied set. Pass every tool the agent needs in ONE invocation:
 looping the command with a single --allow-tool each time leaves only the last
 name allowed.
 
@@ -323,10 +323,10 @@ export async function updateAgent(
 
   // DECISION: there is no assertPriced twin for tools, and that is a choice, not
   // an omission. The obvious guard would be membership in the caller's tool
-  // catalog — but Aegis has no Acme catalog, and hardcoding one here would make
+  // catalog — but Aegis has no consumer catalog, and hardcoding one here would make
   // this file a second source of truth that drifts silently from the real one.
-  // The membership assertion therefore belongs to the Acme seed script, which
-  // imports the catalog directly (allCandidateToolsFlat()).
+  // The membership assertion therefore belongs to the consumer's own seeding
+  // code, which can import its catalog directly.
   //
   // Naming the consequence so the gap is visible to whoever reads this next:
   // policy/bundle/gateway.rego authorizes with `input.request.tool in
@@ -389,20 +389,20 @@ export async function updateAgent(
     // The tool name is appended to the base path VERBATIM two lines below, so
     // it is as load-bearing for the destination as the base itself — and
     // assertMcpBase validates only the base. Concrete bad end-state without
-    // this guard: `--mcp-tool '../../../api/blueprints'` registers a live
+    // this guard: `--mcp-tool '../../../api/records'` registers a live
     // credential whose stored URL WHATWG normalization (which fetch applies)
-    // collapses to a whole-tenant Acme route the exec path does not serve,
-    // carrying the gateway-injected PAT — every other Acme tenant route accepts
-    // that bearer, because scope is enforced only at the exec endpoint. A
-    // query, fragment, path separator, percent-escape or space does the same
-    // thing more quietly. `encodeURIComponent` is not a fix here:
+    // collapses to a different route on the upstream service, outside the
+    // tool path, carrying the gateway-injected credential. For a consumer
+    // whose routes trust the injected credential, that call lands with the
+    // credential's full authority. A query, fragment, path separator,
+    // percent-escape or space does the same thing more quietly. `encodeURIComponent` is not a fix here:
     // `encodeURIComponent('..') === '..'`.
     //
     // REFUSE, never sanitize (ASVS V5): a rewritten name would silently
     // register a target the caller never asked for, and `policy/bundle/
     // gateway.rego` matches allowedTools by plain set membership — so a
     // silently-altered name is a permanent, invisible deny. This is a CHARSET
-    // check, deliberately not a catalog-membership check: Aegis has no Acme
+    // check, deliberately not a catalog-membership check: Aegis has no consumer
     // tool catalog, and inventing one here was correctly declined above.
     const TOOL_NAME = /^[A-Za-z0-9_-]+(\.[A-Za-z0-9_-]+)*$/;
     for (const tool of trimmed) {
@@ -430,9 +430,8 @@ export async function updateAgent(
   const [agent] = await db.select().from(agents).where(eq(agents.name, opts.agentName)).limit(1);
   if (!agent) {
     throw new Error(
-      `unknown agent name: ${opts.agentName}. Agent names are globally unique and Acme's lane ` +
-      `agents follow the tenant-qualified convention acme-{lane}-{acme-tenant-uuid} ` +
-      `(lane = advisor | architect | governance). Nothing was written.`,
+      `unknown agent name: ${opts.agentName}. Agent names are globally unique. Check the ` +
+      `exact registered name, including any tenant qualifier. Nothing was written.`,
     );
   }
 

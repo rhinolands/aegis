@@ -30,7 +30,7 @@
 //
 //  4. `allowed_tools` is set by this CLI and REPLACED wholesale. A seeding
 //     caller that looped one flag per invocation would leave only the last name
-//     allowed, and an accumulate-instead-of-replace bug would widen a lane
+//     allowed, and an accumulate-instead-of-replace bug would widen an agent
 //     silently — so the replacement property is asserted by passing three names
 //     and then one, and reading back exactly one.
 //
@@ -69,13 +69,13 @@ const ORIGIN = 'https://api.anthropic.com';
 // so nothing in the script is restructured to make it testable.
 const FAULTY_CFG = { ...cfg, auditMasterKey: Buffer.alloc(8) };
 
-// The real shape the Acme seed will pass: an in-cluster http origin carrying the
+// The real shape a consumer seed will pass: an in-cluster http origin carrying the
 // exec path. Both halves matter — `http:` because there is no TLS on a cluster
 // service DNS name, and the path because the MCP plane fetches this URL verbatim.
-const MCP_BASE = 'http://acme-api.acme-system.svc.cluster.local:3001/internal/mcp/tools';
-const TOOL_READ = 'acme.blueprint.read';
-const TOOL_PROPOSE = 'acme.blueprint.propose_edit';
-const TOOL_RULE = 'acme.advisor.lookup_rule';
+const MCP_BASE = 'http://tools-api.tools-system.svc.cluster.local:3001/internal/mcp/tools';
+const TOOL_READ = 'docs.page.read';
+const TOOL_PROPOSE = 'docs.page.propose_edit';
+const TOOL_RULE = 'docs.rules.lookup';
 
 /** Number of `(agent, llm:anthropic)` credential rows. The whole invariant is that this is 1. */
 async function credentialRowCount(db: DrizzleDb, agentId: string): Promise<number> {
@@ -110,7 +110,7 @@ describe('update-agent CLI core', () => {
     try {
       const name = freshName('models');
       const { agent } = await registerAgent(db, {
-        name, tenant: 'test', allowedTools: ['acme-none'],
+        name, tenant: 'test', allowedTools: ['placeholder-none'],
       });
       expect(agent.allowedModels).toEqual([]);
 
@@ -123,10 +123,10 @@ describe('update-agent CLI core', () => {
       const [row] = await db.select().from(agents).where(eq(agents.id, agent.id)).limit(1);
       expect(row.allowedModels).toEqual([PRICED_SONNET, PRICED_HAIKU]);
       // No tools flag was supplied, so `allowed_tools` is not in the SET clause at
-      // all and the live ["acme-none"] placeholder survives untouched. This CLI
+      // all and the live ["placeholder-none"] placeholder survives untouched. This CLI
       // now manages that column (see the symmetric case below); the two columns
       // must not bleed into each other in either direction.
-      expect(row.allowedTools).toEqual(['acme-none']);
+      expect(row.allowedTools).toEqual(['placeholder-none']);
     } finally {
       await sql.end();
     }
@@ -137,7 +137,7 @@ describe('update-agent CLI core', () => {
     try {
       const name = freshName('tools');
       const { agent } = await registerAgent(db, {
-        name, tenant: 'test', allowedTools: ['acme-none'], allowedModels: [PRICED_HAIKU],
+        name, tenant: 'test', allowedTools: ['placeholder-none'], allowedModels: [PRICED_HAIKU],
       });
 
       const result = await updateAgent(db, cfg, {
@@ -160,12 +160,12 @@ describe('update-agent CLI core', () => {
     const { db, sql } = getDb(cfg);
     try {
       const name = freshName('toolreplace');
-      const { agent } = await registerAgent(db, { name, tenant: 'test', allowedTools: ['acme-none'] });
+      const { agent } = await registerAgent(db, { name, tenant: 'test', allowedTools: ['placeholder-none'] });
 
       await updateAgent(db, cfg, { agentName: name, allowTools: [TOOL_READ, TOOL_PROPOSE, TOOL_RULE] });
       // A caller that looped `--allow-tool` once per tool would land here with
       // one name and expect three. Whole-array replacement makes that mistake
-      // loud (a lane denied everything but the last tool) rather than silent.
+      // loud (an agent denied everything but the last tool) rather than silent.
       const second = await updateAgent(db, cfg, { agentName: name, allowTools: [TOOL_RULE] });
       expect(second.allowedTools).toEqual([TOOL_RULE]);
 
@@ -180,7 +180,7 @@ describe('update-agent CLI core', () => {
     const { db, sql } = getDb(cfg);
     try {
       const name = freshName('tooldupe');
-      const { agent } = await registerAgent(db, { name, tenant: 'test', allowedTools: ['acme-none'] });
+      const { agent } = await registerAgent(db, { name, tenant: 'test', allowedTools: ['placeholder-none'] });
 
       const result = await updateAgent(db, cfg, {
         agentName: name,
@@ -199,13 +199,13 @@ describe('update-agent CLI core', () => {
     const { db, sql } = getDb(cfg);
     try {
       const name = freshName('mcpwrite');
-      const { agent } = await registerAgent(db, { name, tenant: 'test', allowedTools: ['acme-none'] });
+      const { agent } = await registerAgent(db, { name, tenant: 'test', allowedTools: ['placeholder-none'] });
 
       const result = await updateAgent(db, cfg, {
         agentName: name,
         mcpTools: [TOOL_READ, TOOL_PROPOSE],
         mcpUpstreamBase: MCP_BASE,
-        secret: 'acme-pat-value',
+        secret: 'upstream-secret-value',
       });
 
       expect(result.mcpCredentials.map((c) => c.target))
@@ -234,7 +234,7 @@ describe('update-agent CLI core', () => {
     const { db, sql } = getDb(cfg);
     try {
       const name = freshName('mcpdet');
-      const { agent } = await registerAgent(db, { name, tenant: 'test', allowedTools: ['acme-none'] });
+      const { agent } = await registerAgent(db, { name, tenant: 'test', allowedTools: ['placeholder-none'] });
 
       await updateAgent(db, cfg, {
         agentName: name, mcpTools: [TOOL_READ], mcpUpstreamBase: MCP_BASE, secret: 'pat-first',
@@ -262,10 +262,10 @@ describe('update-agent CLI core', () => {
     const { db, sql } = getDb(cfg);
     try {
       const name = freshName('mcpcollapse');
-      const { agent } = await registerAgent(db, { name, tenant: 'test', allowedTools: ['acme-none'] });
+      const { agent } = await registerAgent(db, { name, tenant: 'test', allowedTools: ['placeholder-none'] });
 
       // The real helper twice, not a synthetic fixture: this is exactly how a
-      // re-run of a seed script would produce the hazard.
+      // re-run of a seeding script would produce the hazard.
       await putCredential(db, cfg, agent.id, `mcp:${TOOL_READ}`, 'placeholder-one', `${MCP_BASE}/${TOOL_READ}`);
       await putCredential(db, cfg, agent.id, `mcp:${TOOL_READ}`, 'placeholder-two', `${MCP_BASE}/${TOOL_READ}`);
       expect(await mcpRowCount(db, agent.id, TOOL_READ)).toBe(2);
@@ -287,7 +287,7 @@ describe('update-agent CLI core', () => {
     const { db, sql } = getDb(cfg);
     try {
       const name = freshName('scoped');
-      const { agent } = await registerAgent(db, { name, tenant: 'test', allowedTools: ['acme-none'] });
+      const { agent } = await registerAgent(db, { name, tenant: 'test', allowedTools: ['placeholder-none'] });
 
       // The relaxation is scoped to mcp:* — the LLM route still appends
       // `/v1/messages` itself and still must not carry the credential in clear.
@@ -320,7 +320,7 @@ describe('update-agent CLI core', () => {
     const { db, sql } = getDb(cfg);
     try {
       const name = freshName('mcpblank');
-      const { agent } = await registerAgent(db, { name, tenant: 'test', allowedTools: ['acme-none'] });
+      const { agent } = await registerAgent(db, { name, tenant: 'test', allowedTools: ['placeholder-none'] });
       await updateAgent(db, cfg, {
         agentName: name, mcpTools: [TOOL_READ], mcpUpstreamBase: MCP_BASE, secret: 'pat-real',
       });
@@ -337,7 +337,7 @@ describe('update-agent CLI core', () => {
       // The refusal PRECEDES the first write: the tools column still holds the
       // placeholder it was registered with, not the half-applied allowTools set.
       const [row] = await db.select().from(agents).where(eq(agents.id, agent.id)).limit(1);
-      expect(row.allowedTools).toEqual(['acme-none']);
+      expect(row.allowedTools).toEqual(['placeholder-none']);
       expect(await credentialSnapshot(db, agent.id)).toEqual(beforeCreds);
       expect(await mcpRowCount(db, agent.id, TOOL_PROPOSE)).toBe(0);
     } finally {
@@ -349,22 +349,22 @@ describe('update-agent CLI core', () => {
     const { db, sql } = getDb(cfg);
     try {
       const name = freshName('mcptraversal');
-      const { agent } = await registerAgent(db, { name, tenant: 'test', allowedTools: ['acme-none'] });
+      const { agent } = await registerAgent(db, { name, tenant: 'test', allowedTools: ['placeholder-none'] });
       await updateAgent(db, cfg, {
         agentName: name, mcpTools: [TOOL_READ], mcpUpstreamBase: MCP_BASE, secret: 'pat-real',
       });
       const beforeCreds = await credentialSnapshot(db, agent.id);
 
-      // The exact value from the Phase-46 review (WR-02). `${base}/${tool}`
-      // yields `…/internal/mcp/tools/../../../api/blueprints`, which the WHATWG
-      // URL normalization inside fetch() collapses to `…/api/blueprints` — a
-      // REGISTERED credential pointing at a whole-tenant Acme route the exec
-      // path does not serve, carrying the gateway-injected PAT. `encodeURIComponent`
+      // The exact shape from review finding WR-02. `${base}/${tool}`
+      // yields `…/internal/mcp/tools/../../../api/records`, which the WHATWG
+      // URL normalization inside fetch() collapses to `…/api/records` — a
+      // REGISTERED credential pointing at an upstream route outside the tool
+      // path, carrying the gateway-injected credential. `encodeURIComponent`
       // does not help: it leaves `..` unchanged.
       await expect(updateAgent(db, cfg, {
         agentName: name,
         allowTools: [TOOL_READ, TOOL_PROPOSE],
-        mcpTools: ['../../../api/blueprints'],
+        mcpTools: ['../../../api/records'],
         mcpUpstreamBase: MCP_BASE,
         secret: 'pat-real',
       })).rejects.toThrow(/--mcp-tool/);
@@ -374,9 +374,9 @@ describe('update-agent CLI core', () => {
       // still holds its registration placeholder and every credential row is
       // byte-identical to the snapshot taken above.
       const [row] = await db.select().from(agents).where(eq(agents.id, agent.id)).limit(1);
-      expect(row.allowedTools).toEqual(['acme-none']);
+      expect(row.allowedTools).toEqual(['placeholder-none']);
       expect(await credentialSnapshot(db, agent.id)).toEqual(beforeCreds);
-      expect(await mcpRowCount(db, agent.id, '../../../api/blueprints')).toBe(0);
+      expect(await mcpRowCount(db, agent.id, '../../../api/records')).toBe(0);
     } finally {
       await sql.end();
     }
@@ -386,7 +386,7 @@ describe('update-agent CLI core', () => {
     const { db, sql } = getDb(cfg);
     try {
       const name = freshName('mcpreserved');
-      const { agent } = await registerAgent(db, { name, tenant: 'test', allowedTools: ['acme-none'] });
+      const { agent } = await registerAgent(db, { name, tenant: 'test', allowedTools: ['placeholder-none'] });
       await updateAgent(db, cfg, {
         agentName: name, mcpTools: [TOOL_READ], mcpUpstreamBase: MCP_BASE, secret: 'pat-real',
       });
@@ -397,11 +397,11 @@ describe('update-agent CLI core', () => {
       // encoded form of a dot segment) and a raw space. None survives a trim,
       // so the existing empty-after-trim refusal cannot be what rejects them.
       const RESERVED = [
-        'acme/blueprint.read',
-        'acme.blueprint?x=1',
-        'acme.blueprint#frag',
-        'acme.%2e%2e',
-        'acme.blueprint read',
+        'docs/page.read',
+        'docs.page?x=1',
+        'docs.page#frag',
+        'docs.%2e%2e',
+        'docs.page read',
       ];
       for (const badTool of RESERVED) {
         await expect(updateAgent(db, cfg, {
@@ -418,7 +418,7 @@ describe('update-agent CLI core', () => {
     const { db, sql } = getDb(cfg);
     try {
       const name = freshName('mcpcharsetok');
-      const { agent } = await registerAgent(db, { name, tenant: 'test', allowedTools: ['acme-none'] });
+      const { agent } = await registerAgent(db, { name, tenant: 'test', allowedTools: ['placeholder-none'] });
 
       // The positive control: a guard that rejected everything would pass the
       // two refusal cases above vacuously (the `allowlist-ceiling.test.ts:44`
@@ -426,12 +426,12 @@ describe('update-agent CLI core', () => {
       // dots between segments, an underscore and a hyphen inside one.
       const ok = await updateAgent(db, cfg, {
         agentName: name,
-        mcpTools: [TOOL_READ, TOOL_PROPOSE, 'acme_lane-01'],
+        mcpTools: [TOOL_READ, TOOL_PROPOSE, 'docs_tool-01'],
         mcpUpstreamBase: MCP_BASE,
         secret: 'pat-real',
       });
       expect(ok.mcpCredentials.map((c) => c.target))
-        .toEqual([`mcp:${TOOL_READ}`, `mcp:${TOOL_PROPOSE}`, 'mcp:acme_lane-01']);
+        .toEqual([`mcp:${TOOL_READ}`, `mcp:${TOOL_PROPOSE}`, 'mcp:docs_tool-01']);
       for (const written of ok.mcpCredentials) expect(written.rowCount).toBe(1);
 
       // The shipped happy path is unchanged: the row reads back with its path intact.
@@ -447,7 +447,7 @@ describe('update-agent CLI core', () => {
     const { db, sql } = getDb(cfg);
     try {
       const name = freshName('mcpnosecret');
-      const { agent } = await registerAgent(db, { name, tenant: 'test', allowedTools: ['acme-none'] });
+      const { agent } = await registerAgent(db, { name, tenant: 'test', allowedTools: ['placeholder-none'] });
 
       await expect(updateAgent(db, cfg, {
         agentName: name, mcpTools: [TOOL_READ], mcpUpstreamBase: MCP_BASE,
@@ -466,7 +466,7 @@ describe('update-agent CLI core', () => {
     const { db, sql } = getDb(cfg);
     try {
       const name = freshName('mcppair');
-      const { agent } = await registerAgent(db, { name, tenant: 'test', allowedTools: ['acme-none'] });
+      const { agent } = await registerAgent(db, { name, tenant: 'test', allowedTools: ['placeholder-none'] });
 
       await expect(updateAgent(db, cfg, {
         agentName: name, allowTools: [TOOL_READ], mcpTools: [TOOL_READ], secret: 'k',
@@ -476,7 +476,7 @@ describe('update-agent CLI core', () => {
       })).rejects.toThrow(/--mcp-tool/);
 
       const [row] = await db.select().from(agents).where(eq(agents.id, agent.id)).limit(1);
-      expect(row.allowedTools).toEqual(['acme-none']);
+      expect(row.allowedTools).toEqual(['placeholder-none']);
       expect(await credentialSnapshot(db, agent.id)).toEqual([]);
     } finally {
       await sql.end();
@@ -493,7 +493,7 @@ describe('update-agent CLI core', () => {
         mcpTools: [TOOL_READ],
         mcpUpstreamBase: MCP_BASE,
         secret: 'k',
-      })).rejects.toThrow(/acme-\{lane\}/);
+      })).rejects.toThrow(/unknown agent name/);
       const after = await db.select({ id: scopedCredentials.id }).from(scopedCredentials);
       expect(after.length).toBe(before.length);
     } finally {
@@ -505,7 +505,7 @@ describe('update-agent CLI core', () => {
     const { db, sql } = getDb(cfg);
     try {
       const name = freshName('replace');
-      const { agent } = await registerAgent(db, { name, tenant: 'test', allowedTools: ['acme-none'] });
+      const { agent } = await registerAgent(db, { name, tenant: 'test', allowedTools: ['placeholder-none'] });
 
       await updateAgent(db, cfg, {
         agentName: name, setCredential: true, secret: 'upstream-key-first', upstreamUrl: ORIGIN,
@@ -535,9 +535,9 @@ describe('update-agent CLI core', () => {
     const { db, sql } = getDb(cfg);
     try {
       const name = freshName('dupe');
-      const { agent } = await registerAgent(db, { name, tenant: 'test', allowedTools: ['acme-none'] });
+      const { agent } = await registerAgent(db, { name, tenant: 'test', allowedTools: ['placeholder-none'] });
 
-      // Reproduce the exact hazard with the raw helper the seed script uses,
+      // Reproduce the exact hazard with the raw helper a seeding script uses,
       // rather than a synthetic one: two blind INSERTs, no constraint to stop them.
       await putCredential(db, cfg, agent.id, LLM_TARGET, 'placeholder-one', ORIGIN);
       await putCredential(db, cfg, agent.id, LLM_TARGET, 'placeholder-two', ORIGIN);
@@ -560,7 +560,7 @@ describe('update-agent CLI core', () => {
     const { db, sql } = getDb(cfg);
     try {
       const name = freshName('llmrollback');
-      const { agent } = await registerAgent(db, { name, tenant: 'test', allowedTools: ['acme-none'] });
+      const { agent } = await registerAgent(db, { name, tenant: 'test', allowedTools: ['placeholder-none'] });
       await updateAgent(db, cfg, {
         agentName: name, setCredential: true, secret: 'upstream-key-original', upstreamUrl: ORIGIN,
       });
@@ -602,7 +602,7 @@ describe('update-agent CLI core', () => {
     const { db, sql } = getDb(cfg);
     try {
       const name = freshName('mcprollback');
-      const { agent } = await registerAgent(db, { name, tenant: 'test', allowedTools: ['acme-none'] });
+      const { agent } = await registerAgent(db, { name, tenant: 'test', allowedTools: ['placeholder-none'] });
       await updateAgent(db, cfg, {
         agentName: name, mcpTools: [TOOL_READ, TOOL_PROPOSE], mcpUpstreamBase: MCP_BASE,
         secret: 'pat-original',
@@ -649,7 +649,7 @@ describe('update-agent CLI core', () => {
     try {
       const name = freshName('unpriced');
       const { agent } = await registerAgent(db, {
-        name, tenant: 'test', allowedTools: ['acme-none'], allowedModels: [PRICED_HAIKU],
+        name, tenant: 'test', allowedTools: ['placeholder-none'], allowedModels: [PRICED_HAIKU],
       });
 
       await expect(updateAgent(db, cfg, {
@@ -671,7 +671,7 @@ describe('update-agent CLI core', () => {
     const { db, sql } = getDb(cfg);
     try {
       const name = freshName('url');
-      const { agent } = await registerAgent(db, { name, tenant: 'test', allowedTools: ['acme-none'] });
+      const { agent } = await registerAgent(db, { name, tenant: 'test', allowedTools: ['placeholder-none'] });
 
       await expect(updateAgent(db, cfg, {
         agentName: name, setCredential: true, secret: 'upstream-key-x',
@@ -700,7 +700,7 @@ describe('update-agent CLI core', () => {
     const { db, sql } = getDb(cfg);
     try {
       const name = freshName('budget');
-      const { agent } = await registerAgent(db, { name, tenant: 'test', allowedTools: ['acme-none'] });
+      const { agent } = await registerAgent(db, { name, tenant: 'test', allowedTools: ['placeholder-none'] });
       await seedBudget(db, agent.id, 1_000_000, 1_000_000);
       await meterUsage(db, agent.id, 1_234, 5_678);
 
@@ -730,7 +730,7 @@ describe('update-agent CLI core', () => {
         allowModels: [PRICED_SONNET],
         setCredential: true,
         secret: 'upstream-key-x',
-      })).rejects.toThrow(/acme-\{lane\}/);
+      })).rejects.toThrow(/unknown agent name/);
       const after = await db.select({ id: scopedCredentials.id }).from(scopedCredentials);
       expect(after.length).toBe(before.length);
     } finally {
@@ -742,7 +742,7 @@ describe('update-agent CLI core', () => {
     const { db, sql } = getDb(cfg);
     try {
       const name = freshName('nosecret');
-      const { agent } = await registerAgent(db, { name, tenant: 'test', allowedTools: ['acme-none'] });
+      const { agent } = await registerAgent(db, { name, tenant: 'test', allowedTools: ['placeholder-none'] });
 
       await expect(updateAgent(db, cfg, { agentName: name, setCredential: true }))
         .rejects.toThrow(/AEGIS_UPSTREAM_SECRET/);
