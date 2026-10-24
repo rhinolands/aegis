@@ -9,7 +9,7 @@ import { Transform, type TransformCallback } from 'node:stream';
 // implementation has to hold anything the lagging branch has not consumed. If
 // the usage-parsing branch is not drained in exact lockstep with the branch
 // feeding the client socket, that buffer grows without limit for the length of
-// the stream — an unbounded-memory denial of service on a long advisor turn
+// the stream — an unbounded-memory denial of service on a long streamed turn
 // (45-RESEARCH.md Pitfall 8). An IN-LINE Transform has no second branch at all:
 // it passes the chunk through untouched and inspects a copy on the way, so the
 // natural backpressure chain from the client socket back to the upstream body
@@ -38,15 +38,15 @@ import { Transform, type TransformCallback } from 'node:stream';
  * `cache_control` reports a tiny input count for a very large real spend.
  * src/pricing/models.ts prices all four classes at their own verified rates.
  *
- * The justification these fields used to carry — "Acme sends no cache_control
- * today, verified by negative grep over packages/advisor" — was retired by
+ * The justification these fields used to carry — "the first consumer sends no
+ * cache_control today" — was retired by
  * CR-02, and it is worth saying why so it is not reinstated. It described the
  * wrong trust boundary. planes/llm-raw.ts is a PASSTHROUGH: it forwards
  * `req.rawLlmBody` verbatim and validates nothing but `model`, and the
  * allowlist keys on `request.model` rather than on body shape. Any
- * authenticated caller — including the non-Acme consumers a vendor-neutral
- * gateway exists to serve — can put `cache_control` in its own body today. What
- * Acme's own client happens to send constrains nothing.
+ * authenticated caller — every consumer a vendor-neutral gateway exists to
+ * serve — can put `cache_control` in its own body today. What any one client
+ * happens to send constrains nothing.
  */
 export interface StreamUsage {
   input: number;

@@ -458,7 +458,7 @@ describe('POST /v1/messages (G1 anthropic-compat raw route)', () => {
       expect(res.statusCode).toBe(500);
       expect(res.statusCode).not.toBe(403);
       expect(res.body).toBe(upstreamBody);
-      // The join key Phase 47's audit correlation will want.
+      // The join key audit correlation needs.
       expect(res.headers['request-id']).toBe('req_relay_500');
 
       // A relayed upstream failure is still an authorized call: the record
@@ -608,8 +608,8 @@ describe('POST /v1/messages (G1 anthropic-compat raw route)', () => {
       expect(body.type).toBe('error');
       expect(body.error?.type).toBe('permission_error');
       expect(body.error?.gateway_code).toBe('model_not_allowed');
-      // D-09: Aegis's internal vocabulary must never reach Acme. The SDK
-      // stuffs the whole body into err.message, which the advisor renders.
+      // D-09: Aegis's internal vocabulary must never reach a consumer. The SDK
+      // stuffs the whole body into err.message, which a consumer may render.
       expect(res.body).not.toContain('deny-by-default');
       expect(res.headers['x-should-retry']).toBe('false');
       // Nothing may reach the upstream on a denial.
@@ -811,9 +811,8 @@ describe('POST /v1/messages (G1 anthropic-compat raw route)', () => {
       await putCredential(db, cfg, agent.id, 'llm:anthropic', 'anthropic-key-xyz', `http://127.0.0.1:${upstream.port}`);
       const app = buildServer({ cfg, db, engine });
 
-      // Generated, never committed as a fixture. ~2 MiB of content, which is
-      // the shape of Acme's assessment prompt (blueprint + cost table + ALZ
-      // findings in one string).
+      // Generated, never committed as a fixture. ~2 MiB of content, the shape
+      // of a long prompt that packs large structured documents into one string.
       const big = 'x'.repeat(2 * 1024 * 1024);
       const res = await app.inject({
         method: 'POST', url: '/v1/messages',

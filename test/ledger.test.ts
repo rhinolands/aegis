@@ -10,36 +10,36 @@ import { formatRow, HEADER, type LedgerRow } from '../scripts/ledger.js';
 const ALLOW_ROW: LedgerRow = {
   seq: 27,
   ts: new Date('2026-08-15T10:00:00.000Z'),
-  tenant: 'acme',
+  tenant: 'acme-demo',
   plane: 'mcp',
   verdict: 'allow',
-  who: { agentId: 'acme-advisor', identity: { agent: 'acme-advisor', onBehalfOf: [] } },
-  what: { target: 'mcp:acme.advisor.lookup_rule', operation: 'invoke', argsDigest: 'abc123' },
-  whenWhere: { origin: 'acme', correlationId: '5a96cc44-0000-0000-0000-000000000001' },
+  who: { agentId: 'support-bot', identity: { agent: 'support-bot', onBehalfOf: [] } },
+  what: { target: 'mcp:docs.rules.lookup', operation: 'invoke', argsDigest: 'abc123' },
+  whenWhere: { origin: 'acme-demo', correlationId: '5a96cc44-0000-0000-0000-000000000001' },
   why: { reason: 'tool-allowlisted' },
 };
 
 const DENY_ROW: LedgerRow = {
   seq: 32,
   ts: new Date('2026-08-15T10:00:05.000Z'),
-  tenant: 'acme',
+  tenant: 'acme-demo',
   plane: 'mcp',
   verdict: 'deny',
-  who: { agentId: 'acme-advisor', identity: { agent: 'acme-advisor', onBehalfOf: [] } },
-  what: { target: 'mcp:acme.admin.delete_tenant', operation: 'invoke', argsDigest: 'def456' },
-  whenWhere: { origin: 'acme', correlationId: '5a96cc44-0000-0000-0000-000000000001' },
+  who: { agentId: 'support-bot', identity: { agent: 'support-bot', onBehalfOf: [] } },
+  what: { target: 'mcp:admin.delete_tenant', operation: 'invoke', argsDigest: 'def456' },
+  whenWhere: { origin: 'acme-demo', correlationId: '5a96cc44-0000-0000-0000-000000000001' },
   why: { reason: 'deny-by-default' },
 };
 
 describe('formatRow — legible allow + deny rendering', () => {
   it('renders an ALLOW row with agent, target, operation, verdict and reason', () => {
     const line = formatRow(ALLOW_ROW);
-    expect(line).toContain('acme-advisor');
-    expect(line).toContain('mcp:acme.advisor.lookup_rule');
+    expect(line).toContain('support-bot');
+    expect(line).toContain('mcp:docs.rules.lookup');
     expect(line).toContain('invoke');
     expect(line).toContain('allow');
     expect(line).toContain('tool-allowlisted');
-    // correlation id is present so the line can be eyeball-joined with Acme's side
+    // correlation id is present so the line can be eyeball-joined with the consumer's side
     expect(line).toContain('5a96cc44-0000-0000-0000-000000000001');
     // pipe-joined, one physical line
     expect(line.split('|')).toHaveLength(HEADER.split('|').length);
@@ -50,7 +50,7 @@ describe('formatRow — legible allow + deny rendering', () => {
     const line = formatRow(DENY_ROW);
     expect(line).toContain('deny');
     expect(line).toContain('deny-by-default');
-    expect(line).toContain('mcp:acme.admin.delete_tenant');
+    expect(line).toContain('mcp:admin.delete_tenant');
   });
 });
 

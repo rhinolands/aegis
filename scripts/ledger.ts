@@ -2,9 +2,8 @@
 // Read-only operator lens over the append-only audit spine. Answers "what just
 // happened for correlation id X" legibly — who / what / why / verdict, one line
 // per gateway decision — without hand-joining raw JSONB or reaching for a stale
-// S3 export. It is the fresh-read companion to Acme's scripts/join-aegis-audit.sh
-// (its column set is a superset of that script's AEGIS projection, so an operator
-// can eyeball-join the two outputs on the shared correlation id).
+// S3 export. Every row carries the correlation id, so an operator can join this
+// output with a consumer's own audit records on that shared id.
 //
 // This tool is STRICTLY read-only: a single SELECT, no INSERT/UPDATE/DELETE, no
 // schema object created, no weakening of the tamper-evident chain. It projects
@@ -15,8 +14,7 @@
 //   npx tsx scripts/ledger.ts --correlation-id <uuid> [--tenant <t>] [--verdict allow|deny]
 //
 // --correlation-id is REQUIRED. An untenanted "all rows" dump is refused by
-// construction (mirrors join-aegis-audit.sh's tenant-predicate discipline):
-// the correlation id is the mandatory filter, --tenant/--verdict further scope it.
+// construction: the correlation id is the mandatory filter, --tenant/--verdict further scope it.
 
 import { realpathSync } from 'node:fs';
 import { pathToFileURL } from 'node:url';
@@ -38,8 +36,8 @@ Read-only projection of audit_records for one correlation id: who / what / why /
 verdict, one line per decision, ordered by seq. --correlation-id is required.
 Never selects or prints the encrypted payload column; renders metadata only.`;
 
-// The columns emitted, in order. A superset of join-aegis-audit.sh's AEGIS_SQL
-// (seq, plane, verdict, target, reason, corr, ts) so the two can be eyeball-joined.
+// The columns emitted, in order. seq, plane, verdict, target, reason, correlation
+// id and ts are the minimum a join with a consumer's own records needs.
 export const HEADER = 'seq|ts|tenant|plane|verdict|agentId|target|operation|reason|correlationId';
 
 // The shape formatRow needs — a projected audit row. The encrypted payload

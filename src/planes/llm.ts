@@ -30,7 +30,7 @@ const bodySchema = z.object({
 
 // Pricing and usage extraction moved to ../pricing/models.ts. The table that
 // used to live here stored ONE rate per model and applied it to input+output
-// summed; both models Acme sends are priced with output at 5x input, so no
+// summed; both priced models are priced with output at 5x input, so no
 // single blended number could be correct. The replacement is verified against
 // the vendor's published pricing plus an independent second source, and it
 // carries the same Number(x) || 0 untrusted-upstream coercion this file used

@@ -80,7 +80,7 @@ describe('POST /mcp/:tool', () => {
     }
   });
 
-  // G6 (Acme Phase 47 / AGW-08): the correlation id must reach the
+  // G6: the correlation id must reach the
   // operator-registered upstream, so the backend's own audit row can be joined
   // to this gateway's record. Asserted on the RECEIVED request recorded by the
   // real ephemeral upstream — "we set a header" and "the header arrived" are
