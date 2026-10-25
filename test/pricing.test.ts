@@ -305,7 +305,7 @@ describe('the 1-hour cache-write class — DEBT-05', () => {
 });
 
 describe('MODEL_PRICES — table shape invariants', () => {
-  it('contains exactly the two model ids Acme sends, and nothing else', () => {
+  it('contains exactly the two verified model ids, and nothing else', () => {
     // A placeholder row reappearing (claude-sonnet-5 / claude-opus-4-8, both
     // [UNVERIFIED] and both wrong in this shape too) fails here.
     expect(Object.keys(MODEL_PRICES).sort()).toEqual([
