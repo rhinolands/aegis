@@ -7,7 +7,7 @@ jobs:
     # Runs on a self-hosted runner with Docker available.
     runs-on: self-hosted
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
       - run: npm ci
 
@@ -16,7 +16,7 @@ jobs:
           docker rm -f aegis-e2e-pg >/dev/null 2>&1 || true
           docker run -d --name aegis-e2e-pg \
             -e POSTGRES_USER=aegis -e POSTGRES_PASSWORD=dev -e POSTGRES_DB=aegis \
-            -p 5432:5432 postgres:16
+            -p 127.0.0.1:5432:5432 postgres:16
           for i in $(seq 1 30); do
             docker exec aegis-e2e-pg pg_isready -U aegis && break
             sleep 2
