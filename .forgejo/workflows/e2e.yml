@@ -4,7 +4,8 @@ on:
 
 jobs:
   e2e:
-    runs-on: ct102
+    # Runs on a self-hosted runner with Docker available.
+    runs-on: self-hosted
     steps:
       - uses: actions/checkout@v4
 
@@ -24,8 +25,8 @@ jobs:
       - name: build + migrate + demo
         env:
           DATABASE_URL: postgres://aegis:dev@localhost:5432/aegis
-          # Throwaway all-zero base64 key for this dispatch-only e2e run —
-          # NOT a real secret. Real keys never appear in workflow files.
+          # Throwaway all-zero base64 key for this dispatch-only e2e run.
+          # It is not a real secret. Real keys never appear in workflow files.
           AUDIT_MASTER_KEY: AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=
         run: |
           npm run build
