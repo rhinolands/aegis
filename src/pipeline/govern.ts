@@ -20,7 +20,7 @@ export interface GovernContext {
   target: string;          // e.g. 'mcp:filesystem', 'llm:anthropic', 'a2a:agent-b'
   correlationId: string;
   origin: string;
-  args?: unknown;          // hashed into what.argsDigest; raw never stored
+  args?: unknown;          // hashed into what.argsDigest; raw value stored encrypted in the audit payload
 }
 
 export interface ExecResult { tokens: number; costMicros: number; body: unknown }

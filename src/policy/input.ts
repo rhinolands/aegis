@@ -9,8 +9,8 @@ export interface PolicyRequest {
   model?: string;
   operation: string;
   // The call arguments, for argument-level rules (data.aegis_constraints in the
-  // Rego). Evaluated in memory only: the audit record still stores just the
-  // argsDigest, never the raw arguments.
+  // Rego). The hashed audit record holds only the argsDigest. The raw arguments
+  // are stored separately, encrypted, in the record's payload column.
   args?: Record<string, unknown>;
 }
 
